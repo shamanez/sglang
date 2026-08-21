@@ -45,7 +45,7 @@ done
 
 curl -s localhost:30000/get_server_info | python3 -c "import json,sys; d=json.load(sys.stdin); print('pp_size', d['pp_size'], 'tp_size', d['tp_size'])"
 
-HARNESS_ARGS=(--label "$LABEL")
+HARNESS_ARGS=(--label "$LABEL" --stages "${STAGES:-wikitext,gsm8k,probe}")
 if [ "${MAKE_REFERENCE:-0}" = "1" ]; then HARNESS_ARGS+=(--make-reference); fi
 python3 /workspace/sglang-src/scripts/vast/ppq/eval_harness.py "${HARNESS_ARGS[@]}" 2>&1 | tee /workspace/ppq/logs/eval_${LABEL}.log
 
