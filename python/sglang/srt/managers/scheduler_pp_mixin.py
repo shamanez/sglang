@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import time
@@ -57,6 +58,88 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+_PP_WIRE_SCALE_SUFFIX = "__wire_scale"
+
+
+@functools.lru_cache(maxsize=1)
+def _pp_activation_wire_quant_mode() -> Optional[str]:
+    mode = envs.SGLANG_PP_ACTIVATION_WIRE_QUANT.get()
+    if not mode:
+        return None
+    mode = mode.lower()
+    if mode not in ("int8", "fp8"):
+        raise ValueError(
+            f"SGLANG_PP_ACTIVATION_WIRE_QUANT must be 'int8' or 'fp8', got {mode!r}"
+        )
+    return mode
+
+
+def _pp_quantize_wire_dict(
+    tensor_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Return a NEW dict with every 2-D floating-point tensor replaced by an
+    8-bit payload plus per-token float32 scales under ``key + suffix``.
+
+    Out of place on purpose: the incoming dict is the model's own
+    pp_hidden_states_proxy_tensors — ``residual`` aliases tensors the current
+    forward still reads, and under CUDA graphs the values are slices of reused
+    static output buffers. Non-float tensors (e.g. int32 topk_indices),
+    non-2-D tensors, and non-tensor entries pass through unchanged.
+    """
+    mode = _pp_activation_wire_quant_mode()
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in tensor_dict.items():
+        if (
+            not isinstance(value, torch.Tensor)
+            or not value.is_floating_point()
+            or value.dim() != 2
+        ):
+            out[key] = value
+            continue
+        x = value.contiguous()
+        if mode == "int8":
+            from sglang.kernels.ops.quantization.int8_kernel import (
+                per_token_quant_int8,
+            )
+
+            q, s = per_token_quant_int8(x)
+        else:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_quant_fp8,
+            )
+
+            q, s = sglang_per_token_quant_fp8(x)
+            # NCCL has no fp8 dtype: ship the bytes, re-view on the far side.
+            q = q.view(torch.uint8)
+        out[key] = q
+        out[key + _PP_WIRE_SCALE_SUFFIX] = s
+    return out
+
+
+def _pp_dequantize_wire_dict(
+    tensor_dict: Dict[str, torch.Tensor], out_dtype: torch.dtype
+) -> Dict[str, torch.Tensor]:
+    """Inverse of :func:`_pp_quantize_wire_dict`.
+
+    The wire format is self-describing — scale keys mark quantized payloads —
+    so the receiver never needs to agree on the env var with the sender. A
+    dict with no scale keys is returned unchanged (the flag-off path).
+    """
+    if not any(key.endswith(_PP_WIRE_SCALE_SUFFIX) for key in tensor_dict):
+        return tensor_dict
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in tensor_dict.items():
+        if key.endswith(_PP_WIRE_SCALE_SUFFIX):
+            continue
+        scale = tensor_dict.get(key + _PP_WIRE_SCALE_SUFFIX)
+        if scale is None:
+            out[key] = value
+            continue
+        q = value.view(torch.float8_e4m3fn) if value.dtype == torch.uint8 else value
+        out[key] = (q.to(torch.float32) * scale.to(torch.float32)).to(out_dtype)
+    return out
 
 
 @dataclass
@@ -1040,6 +1123,8 @@ class SchedulerPPMixin:
                 "PP send: using default untyped message. "
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
+        if msg_type == "proxy" and _pp_activation_wire_quant_mode() is not None:
+            tensor_dict = _pp_quantize_wire_dict(tensor_dict)
         tensor_dict["__msg_type__"] = msg_type
         p2p_work = []
         p2p_work.extend(
@@ -1089,13 +1174,14 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            tensor_dict = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
+            )
             pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
-                )
+                _pp_dequantize_wire_dict(tensor_dict, self.model_config.dtype)
             )
         return pp_proxy_tensors
 
