@@ -47,29 +47,36 @@ def generate(base_url, payload, timeout=600):
 
 
 def score_ids(base_url, input_ids, start_len, topk=0):
-    """Teacher-forced logprobs of input_ids[start_len:] given the prefix."""
+    """Teacher-forced logprobs of input_ids[start_len:] given the prefix.
+
+    Returns a list of (pos, logprob, token_id) plus optionally a dict
+    pos -> top-k [[logprob, token_id], ...]. The server returns entries from
+    the requested start position onward with the FIRST entry's logprob None,
+    so we request start_len - 1 and keep explicit position bookkeeping.
+    """
+    req_start = max(start_len - 1, 0)
     payload = {
         "input_ids": input_ids,
         "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
         "return_logprob": True,
-        "logprob_start_len": start_len,
+        "logprob_start_len": req_start,
     }
     if topk:
         payload["top_logprobs_num"] = topk
     out = generate(base_url, payload)
     meta = out["meta_info"]
-    lps = [
-        (e[0], e[1])
-        for e in meta["input_token_logprobs"]
-        if e is not None and e[0] is not None
-    ]
-    tops = None
-    if topk:
-        tops = [
-            [[t[0], t[1]] for t in pos] if pos else None
-            for pos in meta.get("input_top_logprobs") or []
-        ]
-    return lps, tops
+    entries = meta["input_token_logprobs"]
+    raw_tops = meta.get("input_top_logprobs") if topk else None
+    lps = []
+    tops = {}
+    for j, e in enumerate(entries):
+        pos = req_start + j
+        if pos < start_len or e is None or e[0] is None:
+            continue
+        lps.append((pos, e[0], e[1]))
+        if raw_tops and j < len(raw_tops) and raw_tops[j]:
+            tops[pos] = [[t[0], t[1]] for t in raw_tops[j]]
+    return lps, (tops if topk else None)
 
 
 def wiki_windows(tok, n_windows, window, offset=0):
@@ -116,18 +123,19 @@ def chat_ids(tok, question):
         }
     ]
     try:
-        return tok.apply_chat_template(
+        out = tok.apply_chat_template(
             msgs, add_generation_prompt=True, tokenize=True, enable_thinking=False
         )
     except (TypeError, ValueError):
-        return tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+        out = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+    return out if isinstance(out, list) else list(out["input_ids"])
 
 
 def run_wikitext(base_url, tok, outdir):
     rows = []
     for w, ids in enumerate(wiki_windows(tok, N_WIKI_WINDOWS, WIKI_WINDOW)):
         lps, _ = score_ids(base_url, ids, start_len=1)
-        nll = [-lp for lp, _tid in lps]
+        nll = [-lp for _pos, lp, _tid in lps]
         rows.append({"window": w, "n_tokens": len(nll), "sum_nll": sum(nll)})
         print(f"  wikitext window {w}: {len(nll)} toks, mean nll {sum(nll)/len(nll):.4f}")
     total_nll = sum(r["sum_nll"] for r in rows)
@@ -210,19 +218,19 @@ def run_probe(base_url, out_root, outdir):
         full = ref["prompt_ids"] + ref["cont_ids"]
         start = len(ref["prompt_ids"])
         lps, tops = score_ids(base_url, full, start_len=start, topk=TOPK)
-        # Align: keep exactly the continuation positions.
-        lps = lps[-len(ref["cont_ids"]):]
-        tops = tops[-len(ref["cont_ids"]):] if tops else None
-        rows.append(
-            {
-                "i": i,
-                "kind": ref["kind"],
-                "ref_ids": ref["cont_ids"],
-                "nll": [-lp for lp, _t in lps],
-                "scored_ids": [t for _lp, t in lps],
-                "top": tops,
-            }
-        )
+        # Explicit position alignment: continuation step k is absolute pos start+k.
+        by_pos = {pos: (lp, tid) for pos, lp, tid in lps}
+        steps = []
+        for k, ref_tid in enumerate(ref["cont_ids"]):
+            pos = start + k
+            if pos not in by_pos:
+                continue
+            lp, tid = by_pos[pos]
+            assert tid == ref_tid, f"token mismatch at pos {pos}: {tid} != {ref_tid}"
+            steps.append(
+                {"k": k, "nll": -lp, "top": (tops or {}).get(pos)}
+            )
+        rows.append({"i": i, "kind": ref["kind"], "ref_ids": ref["cont_ids"], "steps": steps})
         print(f"  probe {i}: {len(lps)} positions scored")
     (outdir / "probe.json").write_text(json.dumps(rows))
 
