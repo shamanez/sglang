@@ -46,6 +46,16 @@ def generate(base_url, payload, timeout=600):
     return r.json()
 
 
+def flush_cache(base_url):
+    """Release radix-cache pages between stages: the [T, vocab] input-logprob
+    spikes plus a full cache OOM'd a 0.85-mem-fraction server mid-run."""
+    try:
+        requests.post(f"{base_url}/flush_cache", timeout=60)
+        time.sleep(2)
+    except requests.RequestException as e:
+        print(f"  flush_cache failed (continuing): {e}")
+
+
 def score_ids(base_url, input_ids, start_len, topk=0):
     """Teacher-forced logprobs of input_ids[start_len:] given the prefix.
 
@@ -266,12 +276,15 @@ def main():
         make_reference(args.base_url, tok, out_root)
     if "wikitext" in stages:
         print("[wikitext]")
+        flush_cache(args.base_url)
         run_wikitext(args.base_url, tok, outdir)
     if "gsm8k" in stages:
         print("[gsm8k]")
+        flush_cache(args.base_url)
         run_gsm8k(args.base_url, tok, outdir)
     if "probe" in stages:
         print("[probe]")
+        flush_cache(args.base_url)
         run_probe(args.base_url, out_root, outdir)
     print(f"done: {outdir}")
 
