@@ -68,6 +68,20 @@ _PP_WIRE_MODE_DIVISOR = {"int4": 2, "mxfp8": 32, "mxfp4": 32, "nvfp4": 16}
 _E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 _E4M3_MAX = 448.0
+# Per-device e2m1 constants; building them per call would enqueue an H2D copy
+# that blocks the scheduler until the stream drains, on every proxy send/recv.
+_E2M1_CONST_CACHE: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _pp_e2m1_consts(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    consts = _E2M1_CONST_CACHE.get(device)
+    if consts is None:
+        consts = (
+            torch.tensor(_E2M1_MIDPOINTS, device=device, dtype=torch.float32),
+            torch.tensor(_E2M1_GRID, device=device, dtype=torch.float32),
+        )
+        _E2M1_CONST_CACHE[device] = consts
+    return consts
 
 
 def resolve_pp_wire_quant_mode() -> Optional[str]:
@@ -114,21 +128,24 @@ def _pp_unpack_nibbles(packed: torch.Tensor) -> torch.Tensor:
 
 def _pp_e8m0_block_scale(x: torch.Tensor, block: int, fmt_max: float):
     # E8M0 scales are pure powers of two, stored as the biased exponent byte;
-    # ceil keeps every value in the block within fmt_max after scaling.
+    # ceil keeps every value in the block within fmt_max after scaling. The
+    # upper clamp keeps fmt_max * 2^exp finite in fp32: values past it (bf16
+    # divergence territory) clip instead of decoding to inf.
     blocks = x.float().reshape(x.shape[0], -1, block)
     absmax = blocks.abs().amax(dim=-1).clamp_min(1e-30)
-    exp = torch.ceil(torch.log2(absmax / fmt_max)).clamp_(-127, 127)
+    exp_max = 127 - math.ceil(math.log2(fmt_max))
+    exp = torch.ceil(torch.log2(absmax / fmt_max)).clamp_(-127, exp_max)
     return blocks, torch.exp2(exp), (exp + 127).to(torch.uint8)
 
 
 def _pp_e2m1_encode(y: torch.Tensor) -> torch.Tensor:
-    bounds = torch.tensor(_E2M1_MIDPOINTS, device=y.device, dtype=torch.float32)
-    idx = torch.bucketize(y.abs(), bounds).to(torch.uint8)
+    bounds, _ = _pp_e2m1_consts(y.device)
+    idx = torch.bucketize(y.abs(), bounds, out_int32=True).to(torch.uint8)
     return idx | ((y < 0).to(torch.uint8) << 3)
 
 
 def _pp_e2m1_decode(codes: torch.Tensor) -> torch.Tensor:
-    grid = torch.tensor(_E2M1_GRID, device=codes.device, dtype=torch.float32)
+    _, grid = _pp_e2m1_consts(codes.device)
     mag = grid[(codes & 0x7).long()]
     return torch.where((codes & 0x8).bool(), -mag, mag)
 
@@ -140,12 +157,20 @@ def _pp_pack_mxfp8_per_block(x: torch.Tensor):
     return q, scale_bytes
 
 
+def _pp_clamp_to_dtype(x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    # Rounding up inside the quant grid can push the decoded product past
+    # out_dtype's max (e.g. fp16 outlier channels); clamp instead of inf.
+    lim = torch.finfo(out_dtype).max
+    return x.clamp_(-lim, lim).to(out_dtype)
+
+
 def _pp_unpack_mxfp8_per_block(
     packed: torch.Tensor, scale_bytes: torch.Tensor, out_dtype: torch.dtype
 ) -> torch.Tensor:
     scale = torch.exp2(scale_bytes.float() - 127.0)
     vals = packed.view(torch.float8_e4m3fn).float().reshape(packed.shape[0], -1, 32)
-    return (vals * scale.unsqueeze(-1)).reshape(packed.shape[0], -1).to(out_dtype)
+    vals = (vals * scale.unsqueeze(-1)).reshape(packed.shape[0], -1)
+    return _pp_clamp_to_dtype(vals, out_dtype)
 
 
 def _pp_pack_mxfp4_per_block(x: torch.Tensor):
@@ -160,7 +185,7 @@ def _pp_unpack_mxfp4_per_block(
     scale = torch.exp2(scale_bytes.float() - 127.0)
     vals = _pp_e2m1_decode(_pp_unpack_nibbles(packed))
     vals = vals.reshape(packed.shape[0], -1, 32) * scale.unsqueeze(-1)
-    return vals.reshape(packed.shape[0], -1).to(out_dtype)
+    return _pp_clamp_to_dtype(vals.reshape(packed.shape[0], -1), out_dtype)
 
 
 def _pp_pack_nvfp4_per_block(x: torch.Tensor):
@@ -188,11 +213,13 @@ def _pp_unpack_nvfp4_per_block(
     packed: torch.Tensor, sidecar: torch.Tensor, out_dtype: torch.dtype
 ) -> torch.Tensor:
     bs = sidecar[:, :-4].contiguous().view(torch.float8_e4m3fn).float()
-    global_scale = sidecar[:, -4:].contiguous().view(torch.float32)
+    # clone(), not contiguous(): a [1, N] slice is already "contiguous" with a
+    # nonzero storage offset, and view(float32) needs offset % 4 == 0.
+    global_scale = sidecar[:, -4:].clone().view(torch.float32)
     eff_scale = (bs * global_scale).clamp_min(1e-30)
     vals = _pp_e2m1_decode(_pp_unpack_nibbles(packed))
     vals = vals.reshape(packed.shape[0], -1, 16) * eff_scale.unsqueeze(-1)
-    return vals.reshape(packed.shape[0], -1).to(out_dtype)
+    return _pp_clamp_to_dtype(vals.reshape(packed.shape[0], -1), out_dtype)
 
 
 def _pp_unpack_int4_per_token(
