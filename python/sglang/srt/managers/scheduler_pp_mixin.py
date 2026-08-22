@@ -126,7 +126,11 @@ def _pp_quantize_wire_dict(
             and (mode != "int4" or value.shape[1] % 2 == 0)
         )
         if not eligible:
-            if isinstance(value, torch.Tensor) and value.is_floating_point():
+            if (
+                isinstance(value, torch.Tensor)
+                and value.is_floating_point()
+                and value.numel() > 0
+            ):
                 logger.warning_once(
                     f"PP wire quant ({mode}): key {key!r} shape "
                     f"{tuple(value.shape)} is not eligible; sent at full "
