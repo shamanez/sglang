@@ -1,0 +1,88 @@
+<meta charset="utf-8">
+<title>PP Wire Codec Notes</title>
+<style>
+:root { --bg:#F7F8F5; --ink:#20242A; --muted:#5C6470; --line:#DDE2DA; --accent:#0E6B5E; --alert:#B3271E; --surface:#fff; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#14171B; --ink:#E7EAE4; --muted:#9AA3AC; --line:#2C3238; --accent:#4FC3AF; --alert:#FF8073; --surface:#1C2025; } }
+:root[data-theme="dark"] { --bg:#14171B; --ink:#E7EAE4; --muted:#9AA3AC; --line:#2C3238; --accent:#4FC3AF; --alert:#FF8073; --surface:#1C2025; }
+body { background:var(--bg); color:var(--ink); font-family:system-ui,sans-serif; line-height:1.55; margin:0 auto; max-width:860px; padding:40px 24px 90px; }
+h1 { font-size:1.9rem; margin-bottom:4px; text-wrap:balance; }
+h2 { border-top:2px solid var(--ink); padding-top:12px; margin-top:40px; font-size:1.25rem; }
+.mono, code { font-family:ui-monospace,monospace; font-size:.85em; }
+.answer { background:var(--surface); border:1px solid var(--accent); border-left:5px solid var(--accent); border-radius:5px; padding:12px 18px; margin:20px 0; }
+table { border-collapse:collapse; width:100%; font-size:.85rem; }
+td,th { border:1px solid var(--line); padding:6px 9px; text-align:left; vertical-align:top; }
+thead th { background:var(--surface); font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+.tablewrap { overflow-x:auto; margin:14px 0; }
+pre { background:var(--surface); border:1px solid var(--line); border-radius:5px; padding:12px 14px; overflow-x:auto; font-size:.8rem; }
+.note { color:var(--muted); font-size:.85rem; }
+</style>
+
+<h1>PP Wire Codec Notes</h1>
+<p class="note">How quantization of pipeline-parallel boundary activations is implemented in this tree · branch <span class="mono">research/pp-activation-int8</span> · 2026-08-22</p>
+
+<div class="answer">
+<strong>Short answer: this did not exist in SGLang — we built it.</strong> Upstream (<span class="mono">main</span>, commit <span class="mono">528bfac70</span>) ships pipeline-parallel inter-stage activations as raw model-dtype (bf16) bytes unconditionally; a repo-wide sweep found no option, env var, or code path that compresses the PP wire, and <span class="mono">main</span>'s <span class="mono">scheduler_pp_mixin.py</span> contains zero quantization symbols. The codec on this branch is new code, activated with <span class="mono">SGLANG_PP_ACTIVATION_WIRE_QUANT=int8|fp8|int4</span> on a server launched with <span class="mono">--pp-size ≥ 2</span>.
+</div>
+
+<h2>1 · What stock SGLang does at a PP boundary</h2>
+<p>Each stage boundary ships one dict per microbatch through a single funnel in the scheduler: <span class="mono">_pp_send_dict_to_next_stage()</span> → <span class="mono">GroupCoordinator.send_tensor_dict()</span> (plain <span class="mono">torch.distributed</span> P2P over NCCL), received by <span class="mono">_pp_recv_proxy_tensors()</span>. The payload is <span class="mono">hidden_states</span> and <span class="mono">residual</span>, each <span class="mono">[tokens, hidden_size]</span> in the model dtype (some models add extras, e.g. DeepSeek's int32 <span class="mono">topk_indices</span>). Shape/dtype metadata is pickled over a CPU (gloo) group, so the receiver allocates whatever dtypes arrive — the transport was already dtype-agnostic, which is what made a wire codec possible without touching the protocol.</p>
+<p>Quantization existed in stock SGLang only at <em>other</em> sites — none of them the PP wire:</p>
+<div class="tablewrap"><table><thead><tr><th>existing mechanism</th><th>site</th><th>why it doesn't cover PP</th></tr></thead><tbody>
+<tr><td><span class="mono">--quantization</span> W8A8-int8 / fp8</td><td>GEMM inputs inside a layer</td><td>low-precision tensor never leaves the kernel call; compute-side, not transport</td></tr>
+<tr><td><span class="mono">SGLANG_ENABLE_DP_GATHER_FP8</span></td><td>DP-MoE variable-length all-gather</td><td>different collective, different ring; was our design template (fp8-as-uint8 trick, per-token-group scales)</td></tr>
+<tr><td><span class="mono">enable_quant_communications</span></td><td>TP all-reduce</td><td>hard-gated to NPU (<span class="mono">device != "npu"</span> raises); prefill-only</td></tr>
+<tr><td>ROCm quick-all-reduce (INT8/6/4)</td><td>TP all-reduce</td><td>gfx94/95 only; all-reduce, not P2P</td></tr>
+<tr><td>DeepEP fp8/nvfp4 dispatch</td><td>MoE all-to-all</td><td>expert dispatch path, consumed directly by fp8 GEMMs</td></tr>
+</tbody></table></div>
+
+<h2>2 · What we added</h2>
+<p>All codec logic lives in <span class="mono">python/sglang/srt/managers/scheduler_pp_mixin.py</span> (commits <span class="mono">ea23f5b7a</span>…<span class="mono">32e70d8ef</span>), plus one env var in <span class="mono">environ.py:585</span> and a docs row. It quantizes just before the send and dequantizes just after the receive, so the model, CUDA graphs, and all math see bf16 exactly as before; only the bytes in flight change. Design points, several hardened by a post-hoc code review:</p>
+<div class="tablewrap"><table><thead><tr><th>piece</th><th>where</th><th>what it does</th></tr></thead><tbody>
+<tr><td>mode resolution</td><td><span class="mono">resolve_pp_wire_quant_mode()</span> :67, called from <span class="mono">init_pp_loop_state</span></td><td>validates the env var at startup on every PP rank (a typo fails before weight load is wasted); fp8 requires the CUDA/MUSA kernel</td></tr>
+<tr><td>quantize</td><td><span class="mono">_pp_quantize_wire_dict()</span> :108, hooked at :1182</td><td>per-token scales: int8 via the production <span class="mono">per_token_quant_int8</span> Triton kernel; fp8-e4m3 via <span class="mono">sglang_per_token_quant_fp8</span>, shipped as uint8 (NCCL has no fp8 dtype); int4 packed two nibbles per byte. Out-of-place — the proxy dict aliases live forward state and CUDA-graph buffers. Only 2-D float tensors with rows &gt; 0 are eligible; anything else passes through with a mixed-wire warning</td></tr>
+<tr><td>wire format</td><td><span class="mono">__wire_codec__</span> tag :63 + <span class="mono">&lt;key&gt;__wire_scale</span> sidecars</td><td>self-describing and collision-guarded: the receiver keys off the codec tag, never off dtype sniffing, so fp8-as-uint8 and int4-packed-uint8 can't be confused and model keys can't be swallowed</td></tr>
+<tr><td>dequantize</td><td><span class="mono">_pp_dequantize_wire_dict()</span> :166, hooked at :1242</td><td>rebuilds bf16 before anything downstream (including the CUDA-graph static-buffer copy) sees the dict; untagged dicts return as the same object — the flag-off path is untouched</td></tr>
+<tr><td>scope</td><td>proxy ring only</td><td>the <span class="mono">"output"</span> ring (next-token ids, logprobs) is never quantized</td></tr>
+</tbody></table></div>
+<p>Isolated roundtrip error: int8 0.66% max per-token relative, fp8 3.8%, int4 7.3%.</p>
+
+<h2>3 · How much communication does it save?</h2>
+<p>Each boundary crossing ships two <span class="mono">[tokens, H]</span> tensors, so the stock wire costs <strong>4·H bytes per token per boundary</strong> (bf16). The codec replaces that with the quantized values plus one fp32 scale per token per tensor: int8/fp8 → <span class="mono">2·H + 8</span> bytes, int4 (two values per byte) → <span class="mono">H + 8</span> bytes. At this model's hidden size (H = 2048):</p>
+<div class="tablewrap"><table><thead><tr><th>wire mode</th><th>bytes / token / boundary</th><th>vs bf16</th><th>wire saved</th><th>per request, pp2 (1 boundary)</th><th>per request, pp4 (3 boundaries)</th></tr></thead><tbody>
+<tr><td>bf16 (stock)</td><td>8,192 B</td><td>1.00×</td><td>—</td><td>10.49 MB</td><td>31.46 MB</td></tr>
+<tr><td>int8 / fp8</td><td>4,104 B</td><td>2.00×</td><td><strong>49.9%</strong></td><td>5.25 MB</td><td>15.76 MB</td></tr>
+<tr><td>int4</td><td>2,056 B</td><td>3.98×</td><td><strong>74.9%</strong></td><td>2.63 MB</td><td>7.90 MB</td></tr>
+</tbody></table></div>
+<p class="note">"Per request" = one benchmark-shaped request (1,024 prefill + 256 decode tokens = 1,280 boundary crossings per token position). The scale sidecar is the entire overhead — 4 B per token per tensor, ~0.1% of the bf16 payload — so realized savings equal the format ratio almost exactly.</p>
+<p>Converted to sustained load using each config's measured serving throughput (48-prompt bench, concurrency 16):</p>
+<div class="tablewrap"><table><thead><tr><th>config</th><th>measured tok/s</th><th>boundaries</th><th>wire load</th><th>saved vs bf16 wire</th></tr></thead><tbody>
+<tr><td>pp2 bf16</td><td>4,862</td><td>1</td><td>39.8 MB/s</td><td>—</td></tr>
+<tr><td>pp2 int8</td><td>5,057</td><td>1</td><td>20.8 MB/s</td><td>−50% (and +4% tok/s)</td></tr>
+<tr><td>pp2 int4</td><td>4,656</td><td>1</td><td>9.6 MB/s</td><td>−75%</td></tr>
+<tr><td>pp4 bf16</td><td>4,050</td><td>3</td><td>99.5 MB/s</td><td>—</td></tr>
+<tr><td>pp4 int8</td><td>4,037</td><td>3</td><td>49.7 MB/s</td><td>−50%</td></tr>
+</tbody></table></div>
+<p>Where the savings actually land: <strong>prefill</strong>. A 1,024-token prefill microbatch is 8.39 MB per boundary in bf16, transferred synchronously between stages while the pipeline fills — halving it is what cut median TTFT by 23% (pp2: 406 → 312 ms) and 21% (pp4: 297 → 234 ms). <strong>Decode</strong> transfers are only KB-scale per step, so there is nothing to save and the quant/dequant kernel launches show up as +3–4% ITL instead. On this box the absolute wire load is modest next to PCIe bandwidth — the bytes-per-token ratios are what transfer: over slower links (multi-node Ethernet/IB, the setting the literature survey targets), where the wire is a first-order cost, a 2× / 4× byte cut applies to a much larger share of step time.</p>
+<p class="note">Savings are only half the ledger: int8's 50% cut is quality-free in every metric we measured, while int4's 75% cut collapses GSM8K from 97% to 64% and adds +11% teacher-forced NLL — see the results report for the full six-config comparison.</p>
+
+<h2>4 · How to activate it</h2>
+<pre>
+# on a machine with this branch installed (editable dev install):
+export SGLANG_PP_ACTIVATION_WIRE_QUANT=int8     # or fp8 / int4; unset = stock bf16 wire
+
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3.6-35B-A3B \
+    --tp-size 2 --pp-size 2 \
+    --attention-backend flashinfer
+</pre>
+<p>Constraints worth knowing: the knob is <strong>ignored when <span class="mono">pp_size == 1</span></strong> (there is no wire to compress — the hosted production config, tp4, has zero pipeline boundaries); <span class="mono">fp8</span> requires CUDA/MUSA (rejected at startup elsewhere); PP itself forbids speculative decoding and auto-disables the overlap scheduler; and on models whose proxy dicts carry 3-D tensors (Kimi K3, Gemma4) those tensors ship at full precision with a logged warning — a declared mixed wire.</p>
+
+<h2>5 · Where everything lives</h2>
+<div class="tablewrap"><table><thead><tr><th>artifact</th><th>location</th></tr></thead><tbody>
+<tr><td>codec</td><td><span class="mono">python/sglang/srt/managers/scheduler_pp_mixin.py</span> (:63–:196 helpers, :1182 send hook, :1242 recv hook)</td></tr>
+<tr><td>env var</td><td><span class="mono">python/sglang/srt/environ.py:585</span> + row in <span class="mono">docs/docs/references/environment_variables.mdx</span></td></tr>
+<tr><td>experiment harness</td><td><span class="mono">scripts/vast/ppq/</span> — <span class="mono">eval_harness.py</span>, <span class="mono">run_config.sh</span>, <span class="mono">run_all.sh</span>, <span class="mono">build_report.py</span></td></tr>
+<tr><td>results report</td><td><span class="mono">reports/pp_wire_quant_report.html</span> (six configs: pp2/pp4 × bf16/int8/int4)</td></tr>
+<tr><td>literature survey</td><td><span class="mono">reports/activation-compression-survey.html</span></td></tr>
+</tbody></table></div>
+<p class="note">Upstreaming would want: quantization gated to extend/prefill mode (decode transfers are too small to amortize the kernels — measured +3–4% ITL), a fused dequant writing straight into the graph buffers, row-wise slicing inside <span class="mono">send_tensor_dict</span> so attn-TP ranks don't quantize redundantly, and a producer-declared per-key wire policy instead of shape eligibility.</p>
