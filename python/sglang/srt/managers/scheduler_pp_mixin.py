@@ -61,7 +61,13 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 
 _PP_WIRE_SCALE_SUFFIX = "__wire_scale"
 _PP_WIRE_CODEC_KEY = "__wire_codec__"
-_PP_WIRE_MODES = ("int8", "fp8", "int4")
+_PP_WIRE_MODES = ("int8", "fp8", "int4", "mxfp8", "mxfp4", "nvfp4")
+# Hidden-size divisibility each mode's packing/blocking requires.
+_PP_WIRE_MODE_DIVISOR = {"int4": 2, "mxfp8": 32, "mxfp4": 32, "nvfp4": 16}
+# OCP e2m1 representable magnitudes; codes are sign<<3 | magnitude index.
+_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+_E4M3_MAX = 448.0
 
 
 def resolve_pp_wire_quant_mode() -> Optional[str]:
@@ -96,6 +102,99 @@ def _pp_pack_int4_per_token(x: torch.Tensor):
     return packed, scale
 
 
+def _pp_pack_nibbles(codes: torch.Tensor) -> torch.Tensor:
+    return codes[:, 0::2] | (codes[:, 1::2] << 4)
+
+
+def _pp_unpack_nibbles(packed: torch.Tensor) -> torch.Tensor:
+    return torch.stack((packed & 0xF, (packed >> 4) & 0xF), dim=-1).view(
+        packed.shape[0], -1
+    )
+
+
+def _pp_e8m0_block_scale(x: torch.Tensor, block: int, fmt_max: float):
+    # E8M0 scales are pure powers of two, stored as the biased exponent byte;
+    # ceil keeps every value in the block within fmt_max after scaling.
+    blocks = x.float().reshape(x.shape[0], -1, block)
+    absmax = blocks.abs().amax(dim=-1).clamp_min(1e-30)
+    exp = torch.ceil(torch.log2(absmax / fmt_max)).clamp_(-127, 127)
+    return blocks, torch.exp2(exp), (exp + 127).to(torch.uint8)
+
+
+def _pp_e2m1_encode(y: torch.Tensor) -> torch.Tensor:
+    bounds = torch.tensor(_E2M1_MIDPOINTS, device=y.device, dtype=torch.float32)
+    idx = torch.bucketize(y.abs(), bounds).to(torch.uint8)
+    return idx | ((y < 0).to(torch.uint8) << 3)
+
+
+def _pp_e2m1_decode(codes: torch.Tensor) -> torch.Tensor:
+    grid = torch.tensor(_E2M1_GRID, device=codes.device, dtype=torch.float32)
+    mag = grid[(codes & 0x7).long()]
+    return torch.where((codes & 0x8).bool(), -mag, mag)
+
+
+def _pp_pack_mxfp8_per_block(x: torch.Tensor):
+    blocks, scale, scale_bytes = _pp_e8m0_block_scale(x, 32, _E4M3_MAX)
+    q = (blocks / scale.unsqueeze(-1)).clamp_(-_E4M3_MAX, _E4M3_MAX)
+    q = q.reshape(x.shape[0], -1).to(torch.float8_e4m3fn).view(torch.uint8)
+    return q, scale_bytes
+
+
+def _pp_unpack_mxfp8_per_block(
+    packed: torch.Tensor, scale_bytes: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    scale = torch.exp2(scale_bytes.float() - 127.0)
+    vals = packed.view(torch.float8_e4m3fn).float().reshape(packed.shape[0], -1, 32)
+    return (vals * scale.unsqueeze(-1)).reshape(packed.shape[0], -1).to(out_dtype)
+
+
+def _pp_pack_mxfp4_per_block(x: torch.Tensor):
+    blocks, scale, scale_bytes = _pp_e8m0_block_scale(x, 32, _E2M1_GRID[-1])
+    codes = _pp_e2m1_encode(blocks / scale.unsqueeze(-1)).reshape(x.shape[0], -1)
+    return _pp_pack_nibbles(codes), scale_bytes
+
+
+def _pp_unpack_mxfp4_per_block(
+    packed: torch.Tensor, scale_bytes: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    scale = torch.exp2(scale_bytes.float() - 127.0)
+    vals = _pp_e2m1_decode(_pp_unpack_nibbles(packed))
+    vals = vals.reshape(packed.shape[0], -1, 32) * scale.unsqueeze(-1)
+    return vals.reshape(packed.shape[0], -1).to(out_dtype)
+
+
+def _pp_pack_nvfp4_per_block(x: torch.Tensor):
+    # NVFP4 recipe: per-token fp32 global scale + per-16-block e4m3 scale.
+    # Quantization must use the e4m3-decoded scale so both ends agree.
+    blocks = x.float().reshape(x.shape[0], -1, 16)
+    block_absmax = blocks.abs().amax(dim=-1)
+    global_scale = (
+        block_absmax.amax(dim=-1, keepdim=True) / (_E4M3_MAX * _E2M1_GRID[-1])
+    ).clamp_min(1e-30)
+    bs_e4m3 = (block_absmax / (_E2M1_GRID[-1] * global_scale)).clamp_(
+        0, _E4M3_MAX
+    ).to(torch.float8_e4m3fn)
+    eff_scale = (bs_e4m3.float() * global_scale).clamp_min(1e-30)
+    codes = _pp_e2m1_encode(blocks / eff_scale.unsqueeze(-1)).reshape(x.shape[0], -1)
+    # Sidecar wire layout: [T, H/16] e4m3 block scales as bytes, then the
+    # per-token fp32 global scale as 4 bytes; the receiver splits by column.
+    sidecar = torch.cat(
+        (bs_e4m3.view(torch.uint8), global_scale.view(torch.uint8)), dim=1
+    )
+    return _pp_pack_nibbles(codes), sidecar
+
+
+def _pp_unpack_nvfp4_per_block(
+    packed: torch.Tensor, sidecar: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    bs = sidecar[:, :-4].contiguous().view(torch.float8_e4m3fn).float()
+    global_scale = sidecar[:, -4:].contiguous().view(torch.float32)
+    eff_scale = (bs * global_scale).clamp_min(1e-30)
+    vals = _pp_e2m1_decode(_pp_unpack_nibbles(packed))
+    vals = vals.reshape(packed.shape[0], -1, 16) * eff_scale.unsqueeze(-1)
+    return vals.reshape(packed.shape[0], -1).to(out_dtype)
+
+
 def _pp_unpack_int4_per_token(
     packed: torch.Tensor, scale: torch.Tensor, out_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -123,7 +222,7 @@ def _pp_quantize_wire_dict(
             # The fp8 kernel asserts num_tokens > 0; idle PP+DP-attention
             # microbatches legitimately send [0, H] proxies.
             and value.shape[0] > 0
-            and (mode != "int4" or value.shape[1] % 2 == 0)
+            and value.shape[1] % _PP_WIRE_MODE_DIVISOR.get(mode, 1) == 0
         )
         if not eligible:
             if (
@@ -155,6 +254,12 @@ def _pp_quantize_wire_dict(
             q, s = sglang_per_token_quant_fp8(x)
             # NCCL has no fp8 dtype: ship the bytes, re-view on the far side.
             q = q.view(torch.uint8)
+        elif mode == "mxfp8":
+            q, s = _pp_pack_mxfp8_per_block(x)
+        elif mode == "mxfp4":
+            q, s = _pp_pack_mxfp4_per_block(x)
+        elif mode == "nvfp4":
+            q, s = _pp_pack_nvfp4_per_block(x)
         else:
             q, s = _pp_pack_int4_per_token(x)
         out[key] = q
@@ -180,6 +285,12 @@ def _pp_dequantize_wire_dict(
             out[key] = value
         elif mode == "int4":
             out[key] = _pp_unpack_int4_per_token(value, scale, out_dtype)
+        elif mode == "mxfp8":
+            out[key] = _pp_unpack_mxfp8_per_block(value, scale, out_dtype)
+        elif mode == "mxfp4":
+            out[key] = _pp_unpack_mxfp4_per_block(value, scale, out_dtype)
+        elif mode == "nvfp4":
+            out[key] = _pp_unpack_nvfp4_per_block(value, scale, out_dtype)
         elif mode == "fp8":
             from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 

@@ -1381,7 +1381,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PP_ACTIVATION_WIRE_QUANT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantize the pipeline-parallel inter-stage activation wire format with per-token scales: <code>int8</code>, <code>fp8</code> (CUDA/MUSA only), or <code>int4</code>. Lossy on the wire; the model always sees the model dtype. Ignored when <code>pp_size == 1</code>. Research knob.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantize the pipeline-parallel inter-stage activation wire format. Per-token scales: <code>int8</code>, <code>fp8</code> (CUDA/MUSA only), <code>int4</code>; block scales: <code>mxfp8</code>, <code>mxfp4</code> (e8m0 per 32 elements), <code>nvfp4</code> (e4m3 per 16 + per-token global). Lossy on the wire; the model always sees the model dtype. Ignored when <code>pp_size == 1</code>. Research knob.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>unset</code></td>
     </tr>
     <tr>
