@@ -17,23 +17,45 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-CONFIGS = ["pp2_bf16", "pp2_int8", "pp2_int4", "pp4_bf16", "pp4_int8", "pp4_int4"]
+CONFIGS = [
+    "pp2_bf16", "pp2_int8", "pp2_fp8", "pp2_mxfp8",
+    "pp2_int4", "pp2_mxfp4", "pp2_nvfp4",
+    "pp4_bf16", "pp4_int8", "pp4_fp8", "pp4_mxfp8",
+    "pp4_int4", "pp4_mxfp4", "pp4_nvfp4",
+]
 BASELINE = "pp2_bf16"
+# 8-bit family: greys/teals/blues/purple. 4-bit family: orange/red/gold/magenta.
 COLORS = {
     "pp2_bf16": "#5C6470",
     "pp2_int8": "#0E6B5E",
+    "pp2_fp8": "#1B5E9E",
+    "pp2_mxfp8": "#5B3E96",
     "pp2_int4": "#C25E00",
+    "pp2_mxfp4": "#8A6D00",
+    "pp2_nvfp4": "#A0246E",
     "pp4_bf16": "#9AA3AC",
     "pp4_int8": "#43A08A",
+    "pp4_fp8": "#5D9BD1",
+    "pp4_mxfp8": "#9077C4",
     "pp4_int4": "#B3271E",
+    "pp4_mxfp4": "#C4A000",
+    "pp4_nvfp4": "#D06CA8",
 }
 LABELS = {
     "pp2_bf16": "pp2 bf16 (baseline)",
     "pp2_int8": "pp2 int8 wire",
+    "pp2_fp8": "pp2 fp8 wire (per-token)",
+    "pp2_mxfp8": "pp2 mxfp8 wire (e8m0/32)",
     "pp2_int4": "pp2 int4 wire",
+    "pp2_mxfp4": "pp2 mxfp4 wire (e8m0/32)",
+    "pp2_nvfp4": "pp2 nvfp4 wire (e4m3/16)",
     "pp4_bf16": "pp4 bf16",
     "pp4_int8": "pp4 int8 wire",
+    "pp4_fp8": "pp4 fp8 wire (per-token)",
+    "pp4_mxfp8": "pp4 mxfp8 wire (e8m0/32)",
     "pp4_int4": "pp4 int4 wire",
+    "pp4_mxfp4": "pp4 mxfp4 wire (e8m0/32)",
+    "pp4_nvfp4": "pp4 nvfp4 wire (e4m3/16)",
 }
 LINESTYLES = {c: ("--" if c.startswith("pp4") else "-") for c in CONFIGS}
 BUCKET = 16
@@ -312,8 +334,8 @@ table {{ border-collapse:collapse; width:100%; font-size:.85rem; }} td,th {{ bor
 thead th {{ background:var(--surface); font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }}
 .note {{ color:var(--muted); font-size:.85rem; }}
 </style>
-<h1>8-bit Activations on the Pipeline Wire</h1>
-<p class="note">Qwen/Qwen3.6-35B-A3B · 4× RTX 5090 · sglang dev @ <span class="mono">{commit}</span> · run 2026-08-21</p>
+<h1>Quantized Activations on the Pipeline Wire</h1>
+<p class="note">Qwen/Qwen3.6-35B-A3B · 4× RTX 5090 · sglang dev @ <span class="mono">{commit}</span> · runs 2026-08-21/22</p>
 <!--NARRATIVE_INTRO-->
 <h2>Wire format</h2>
 <div style="overflow-x:auto"><table><thead><tr>
@@ -321,7 +343,11 @@ thead th {{ background:var(--surface); font-size:.72rem; text-transform:uppercas
 </tr></thead><tbody>
 <tr><td>bf16 (stock)</td><td>4,096 B</td><td>—</td><td>8,192 B</td><td>1.00×</td></tr>
 <tr><td>int8 + f32/token scale</td><td>2,048 B</td><td>4 B</td><td>4,104 B</td><td>2.00×</td></tr>
+<tr><td>fp8-e4m3 + f32/token scale</td><td>2,048 B</td><td>4 B</td><td>4,104 B</td><td>2.00×</td></tr>
+<tr><td>mxfp8: e4m3 + e8m0 scale per 32</td><td>2,048 B</td><td>64 B</td><td>4,224 B</td><td>1.94×</td></tr>
 <tr><td>int4 (packed) + f32/token scale</td><td>1,024 B</td><td>4 B</td><td>2,056 B</td><td>3.98×</td></tr>
+<tr><td>mxfp4: e2m1 + e8m0 scale per 32</td><td>1,024 B</td><td>64 B</td><td>2,176 B</td><td>3.76×</td></tr>
+<tr><td>nvfp4: e2m1 + e4m3 scale per 16 + f32/token</td><td>1,024 B</td><td>132 B</td><td>2,312 B</td><td>3.54×</td></tr>
 </tbody></table></div>
 <h2>Headline table</h2>
 <div style="overflow-x:auto"><table><thead><tr>
