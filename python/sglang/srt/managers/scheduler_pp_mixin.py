@@ -213,9 +213,12 @@ def _pp_unpack_nvfp4_per_block(
     packed: torch.Tensor, sidecar: torch.Tensor, out_dtype: torch.dtype
 ) -> torch.Tensor:
     bs = sidecar[:, :-4].contiguous().view(torch.float8_e4m3fn).float()
-    # clone(), not contiguous(): a [1, N] slice is already "contiguous" with a
-    # nonzero storage offset, and view(float32) needs offset % 4 == 0.
-    global_scale = sidecar[:, -4:].clone().view(torch.float32)
+    # Copy into a fresh buffer: contiguous()/clone() on a [1, 4] slice keep the
+    # parent's storage offset/stride, which view(float32) rejects unless the
+    # sidecar width happens to be 4-byte aligned.
+    gs_bytes = sidecar.new_empty((sidecar.shape[0], 4))
+    gs_bytes.copy_(sidecar[:, -4:])
+    global_scale = gs_bytes.view(torch.float32)
     eff_scale = (bs * global_scale).clamp_min(1e-30)
     vals = _pp_e2m1_decode(_pp_unpack_nibbles(packed))
     vals = vals.reshape(packed.shape[0], -1, 16) * eff_scale.unsqueeze(-1)
