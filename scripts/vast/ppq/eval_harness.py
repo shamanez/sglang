@@ -124,6 +124,15 @@ def extract_answer(text):
     return nums[-1].replace(",", "").rstrip(".")
 
 
+def answers_match(pred, gold):
+    # Numeric comparison: '16.00' must equal '16' (string equality understated
+    # accuracy by 4 points in every config of the first run).
+    try:
+        return pred is not None and abs(float(pred) - float(gold)) < 1e-6
+    except ValueError:
+        return False
+
+
 def chat_ids(tok, question):
     msgs = [
         {
@@ -169,7 +178,7 @@ def run_gsm8k(base_url, tok, outdir):
             },
         )
         pred = extract_answer(out["text"])
-        ok = pred is not None and pred == item["gold"]
+        ok = answers_match(pred, item["gold"])
         n_correct += ok
         rows.append(
             {
@@ -252,6 +261,8 @@ def main():
     ap.add_argument("--out", default="/workspace/ppq/results")
     ap.add_argument("--make-reference", action="store_true")
     ap.add_argument("--stages", default="wikitext,gsm8k,probe")
+    ap.add_argument("--expect-pp", type=int, default=None)
+    ap.add_argument("--expect-tp", type=int, default=None)
     args = ap.parse_args()
 
     out_root = Path(args.out)
@@ -260,6 +271,14 @@ def main():
     tok = get_tokenizer()
 
     info = requests.get(f"{args.base_url}/get_server_info", timeout=30).json()
+    # Fail loudly if the live server is not the topology this label claims:
+    # results written under a wrong label poison every downstream comparison.
+    for arg_val, key in ((args.expect_pp, "pp_size"), (args.expect_tp, "tp_size")):
+        if arg_val is not None and info.get(key) != arg_val:
+            raise SystemExit(
+                f"server {key}={info.get(key)} but label {args.label!r} "
+                f"expects {arg_val}; refusing to write mislabeled results"
+            )
     (outdir / "server_info.json").write_text(
         json.dumps(
             {

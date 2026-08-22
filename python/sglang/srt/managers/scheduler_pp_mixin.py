@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import logging
 import math
 import time
@@ -61,43 +60,82 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 
 
 _PP_WIRE_SCALE_SUFFIX = "__wire_scale"
+_PP_WIRE_CODEC_KEY = "__wire_codec__"
+_PP_WIRE_MODES = ("int8", "fp8", "int4")
 
 
-@functools.lru_cache(maxsize=1)
-def _pp_activation_wire_quant_mode() -> Optional[str]:
+def resolve_pp_wire_quant_mode() -> Optional[str]:
+    # Called from init_pp_loop_state so a bad value or unsupported platform
+    # fails at startup on every PP rank, not on the first proxy send.
     mode = envs.SGLANG_PP_ACTIVATION_WIRE_QUANT.get()
     if not mode:
         return None
-    mode = mode.lower()
-    if mode not in ("int8", "fp8"):
+    mode = mode.strip().lower()
+    if mode not in _PP_WIRE_MODES:
         raise ValueError(
-            f"SGLANG_PP_ACTIVATION_WIRE_QUANT must be 'int8' or 'fp8', got {mode!r}"
+            f"SGLANG_PP_ACTIVATION_WIRE_QUANT must be one of {_PP_WIRE_MODES}, "
+            f"got {mode!r}"
         )
+    if mode == "fp8":
+        from sglang.kernels.ops.quantization import fp8_kernel
+
+        # The sgl per-token fp8 kernel is only bound on CUDA/MUSA builds.
+        if not hasattr(fp8_kernel, "sgl_per_token_quant_fp8"):
+            raise ValueError(
+                "SGLANG_PP_ACTIVATION_WIRE_QUANT=fp8 requires the CUDA/MUSA "
+                "sgl per-token fp8 kernel; use int8 or int4 on this platform"
+            )
     return mode
 
 
-def _pp_quantize_wire_dict(
-    tensor_dict: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
-    """Return a NEW dict with every 2-D floating-point tensor replaced by an
-    8-bit payload plus per-token float32 scales under ``key + suffix``.
+def _pp_pack_int4_per_token(x: torch.Tensor):
+    absmax = x.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-10)
+    scale = absmax / 7.0
+    q = torch.round(x.float() / scale).clamp_(-8, 7).to(torch.int16)
+    packed = ((q[:, 0::2] & 0xF) | ((q[:, 1::2] & 0xF) << 4)).to(torch.uint8)
+    return packed, scale
 
-    Out of place on purpose: the incoming dict is the model's own
-    pp_hidden_states_proxy_tensors — ``residual`` aliases tensors the current
-    forward still reads, and under CUDA graphs the values are slices of reused
-    static output buffers. Non-float tensors (e.g. int32 topk_indices),
-    non-2-D tensors, and non-tensor entries pass through unchanged.
-    """
-    mode = _pp_activation_wire_quant_mode()
+
+def _pp_unpack_int4_per_token(
+    packed: torch.Tensor, scale: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    p = packed.to(torch.int16)
+    nibbles = torch.stack((p & 0xF, (p >> 4) & 0xF), dim=-1).view(p.shape[0], -1)
+    q = torch.where(nibbles > 7, nibbles - 16, nibbles)
+    return (q.float() * scale).to(out_dtype)
+
+
+def _pp_quantize_wire_dict(
+    tensor_dict: Dict[str, torch.Tensor], mode: str
+) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}
     for key, value in tensor_dict.items():
-        if (
-            not isinstance(value, torch.Tensor)
-            or not value.is_floating_point()
-            or value.dim() != 2
+        if isinstance(value, torch.Tensor) and (
+            key == _PP_WIRE_CODEC_KEY or key.endswith(_PP_WIRE_SCALE_SUFFIX)
         ):
+            raise ValueError(
+                f"PP proxy key {key!r} collides with the wire-codec protocol"
+            )
+        eligible = (
+            isinstance(value, torch.Tensor)
+            and value.is_floating_point()
+            and value.dim() == 2
+            # The fp8 kernel asserts num_tokens > 0; idle PP+DP-attention
+            # microbatches legitimately send [0, H] proxies.
+            and value.shape[0] > 0
+            and (mode != "int4" or value.shape[1] % 2 == 0)
+        )
+        if not eligible:
+            if isinstance(value, torch.Tensor) and value.is_floating_point():
+                logger.warning_once(
+                    f"PP wire quant ({mode}): key {key!r} shape "
+                    f"{tuple(value.shape)} is not eligible; sent at full "
+                    "precision (mixed-precision wire)"
+                )
             out[key] = value
             continue
+        # Out of place: `value` aliases tensors the current forward still
+        # reads, and under CUDA graphs it is a slice of a reused static buffer.
         x = value.contiguous()
         if mode == "int8":
             from sglang.kernels.ops.quantization.int8_kernel import (
@@ -105,7 +143,7 @@ def _pp_quantize_wire_dict(
             )
 
             q, s = per_token_quant_int8(x)
-        else:
+        elif mode == "fp8":
             from sglang.kernels.ops.quantization.fp8_kernel import (
                 sglang_per_token_quant_fp8,
             )
@@ -113,32 +151,40 @@ def _pp_quantize_wire_dict(
             q, s = sglang_per_token_quant_fp8(x)
             # NCCL has no fp8 dtype: ship the bytes, re-view on the far side.
             q = q.view(torch.uint8)
+        else:
+            q, s = _pp_pack_int4_per_token(x)
         out[key] = q
         out[key + _PP_WIRE_SCALE_SUFFIX] = s
+    out[_PP_WIRE_CODEC_KEY] = mode
     return out
 
 
 def _pp_dequantize_wire_dict(
     tensor_dict: Dict[str, torch.Tensor], out_dtype: torch.dtype
 ) -> Dict[str, torch.Tensor]:
-    """Inverse of :func:`_pp_quantize_wire_dict`.
-
-    The wire format is self-describing — scale keys mark quantized payloads —
-    so the receiver never needs to agree on the env var with the sender. A
-    dict with no scale keys is returned unchanged (the flag-off path).
-    """
-    if not any(key.endswith(_PP_WIRE_SCALE_SUFFIX) for key in tensor_dict):
+    # Triggered only by the reserved codec tag, so an unquantized dict (the
+    # flag-off path, and any model's own key names) passes through untouched.
+    mode = tensor_dict.get(_PP_WIRE_CODEC_KEY)
+    if mode is None:
         return tensor_dict
     out: Dict[str, torch.Tensor] = {}
     for key, value in tensor_dict.items():
-        if key.endswith(_PP_WIRE_SCALE_SUFFIX):
+        if key == _PP_WIRE_CODEC_KEY or key.endswith(_PP_WIRE_SCALE_SUFFIX):
             continue
         scale = tensor_dict.get(key + _PP_WIRE_SCALE_SUFFIX)
         if scale is None:
             out[key] = value
-            continue
-        q = value.view(torch.float8_e4m3fn) if value.dtype == torch.uint8 else value
-        out[key] = (q.to(torch.float32) * scale.to(torch.float32)).to(out_dtype)
+        elif mode == "int4":
+            out[key] = _pp_unpack_int4_per_token(value, scale, out_dtype)
+        elif mode == "fp8":
+            from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+            # fp8_dtype is e4m3fnuz on fnuz platforms; the view must match
+            # what the sender's kernel emitted.
+            out[key] = (value.view(fp8_dtype).to(torch.float32) * scale).to(out_dtype)
+        else:
+            # int8 * f32 promotes to f32 inside one fused elementwise kernel.
+            out[key] = (value * scale).to(out_dtype)
     return out
 
 
@@ -642,6 +688,11 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
+        self.pp_wire_quant_mode: Optional[str] = resolve_pp_wire_quant_mode()
+        if self.pp_wire_quant_mode is not None:
+            logger.info(
+                f"PP activation wire quantization enabled: {self.pp_wire_quant_mode}"
+            )
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
@@ -1123,9 +1174,12 @@ class SchedulerPPMixin:
                 "PP send: using default untyped message. "
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
-        if msg_type == "proxy" and _pp_activation_wire_quant_mode() is not None:
-            tensor_dict = _pp_quantize_wire_dict(tensor_dict)
-        tensor_dict["__msg_type__"] = msg_type
+        if msg_type == "proxy" and self.pp_wire_quant_mode is not None:
+            tensor_dict = _pp_quantize_wire_dict(
+                tensor_dict, mode=self.pp_wire_quant_mode
+            )
+        # Uniformly non-mutating: the caller still owns the original dict.
+        tensor_dict = {**tensor_dict, "__msg_type__": msg_type}
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1181,7 +1235,9 @@ class SchedulerPPMixin:
                 ),
             )
             pp_proxy_tensors = PPProxyTensors(
-                _pp_dequantize_wire_dict(tensor_dict, self.model_config.dtype)
+                _pp_dequantize_wire_dict(
+                    tensor_dict, out_dtype=self.model_config.dtype
+                )
             )
         return pp_proxy_tensors
 

@@ -17,20 +17,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-CONFIGS = ["pp2_bf16", "pp2_int8", "pp4_bf16", "pp4_int8"]
+CONFIGS = ["pp2_bf16", "pp2_int8", "pp2_int4", "pp4_bf16", "pp4_int8", "pp4_int4"]
 BASELINE = "pp2_bf16"
 COLORS = {
     "pp2_bf16": "#5C6470",
     "pp2_int8": "#0E6B5E",
+    "pp2_int4": "#C25E00",
     "pp4_bf16": "#9AA3AC",
-    "pp4_int8": "#B3271E",
+    "pp4_int8": "#43A08A",
+    "pp4_int4": "#B3271E",
 }
 LABELS = {
     "pp2_bf16": "pp2 bf16 (baseline)",
     "pp2_int8": "pp2 int8 wire",
+    "pp2_int4": "pp2 int4 wire",
     "pp4_bf16": "pp4 bf16",
     "pp4_int8": "pp4 int8 wire",
+    "pp4_int4": "pp4 int4 wire",
 }
+LINESTYLES = {c: ("--" if c.startswith("pp4") else "-") for c in CONFIGS}
 BUCKET = 16
 PROBE_LEN = 256
 
@@ -70,6 +75,21 @@ def fig_to_svg(fig):
     return svg[svg.find("<svg") :]
 
 
+def gsm8k_accuracy(g):
+    """Numeric re-grade of the stored per-item results: the first run's
+    string-equality grading scored '16.00' != '16' as wrong (4 points in
+    every config)."""
+
+    def match(pred, gold):
+        try:
+            return pred is not None and abs(float(pred) - float(gold)) < 1e-6
+        except (TypeError, ValueError):
+            return False
+
+    items = g["items"]
+    return sum(match(it["pred"], it["gold"]) for it in items) / len(items)
+
+
 def wilson_ci(p, n, z=1.96):
     if n == 0:
         return (0.0, 0.0)
@@ -104,29 +124,20 @@ def top1_agree(st, row):
     return 1.0 if st["top"][0][1] == ref else 0.0
 
 
-def make_kl_fn(base_probe):
-    """Approximate KL(P_base || Q_cfg) truncated to the baseline's top-5 tokens."""
-    base_tops = {}
-    for row in base_probe:
-        for st in row["steps"]:
-            if st.get("top"):
-                base_tops[(row["i"], st["k"])] = st["top"]
+def make_k3_fn(base_probe):
+    """k3 estimator of KL(base || config) on the shared reference tokens —
+    the same estimator sglang's kl_test_utils calibrates numerics changes
+    with, computed from the per-position logprob pairs already collected."""
+    base_nll = {(r["i"], st["k"]): st["nll"] for r in base_probe for st in r["steps"]}
 
-    def kl(st, row):
-        bt = base_tops.get((row["i"], st["k"]))
-        ct = st.get("top")
-        if not bt or not ct:
+    def k3(st, row):
+        b = base_nll.get((row["i"], st["k"]))
+        if b is None:
             return None
-        cfg_lp = {tid: lp for lp, tid in ct}
-        cfg_min = min(lp for lp, _ in ct) - 1.0
-        p_raw = [math.exp(lp) for lp, _ in bt]
-        q_raw = [math.exp(cfg_lp.get(tid, cfg_min)) for _, tid in bt]
-        ps, qs = sum(p_raw), sum(q_raw)
-        return sum(
-            (p / ps) * math.log((p / ps) / (q / qs)) for p, q in zip(p_raw, q_raw)
-        )
+        logr = max(min(b - st["nll"], 20.0), -20.0)
+        return (math.exp(logr) - 1) - logr
 
-    return kl
+    return k3
 
 
 def build(data, out_path, commit):
@@ -150,45 +161,49 @@ def build(data, out_path, commit):
     figs["wikitext"] = fig_to_svg(fig)
 
     # ---- gsm8k ----
-    fig, ax = plt.subplots(figsize=(7.2, 3.4))
+    fig, ax = plt.subplots(figsize=(7.8, 3.4))
+    gsm_n = None
     for i, c in enumerate(CONFIGS):
         g = data[c]["gsm8k"]
         if not g:
             continue
-        p, n = g["accuracy"], g["n"]
+        p, n = gsm8k_accuracy(g), g["n"]
+        gsm_n = n
         lo, hi = wilson_ci(p, n)
         ax.bar(i, p, color=COLORS[c], width=0.6)
         ax.errorbar(i, p, yerr=[[p - lo], [hi - p]], color="#222", capsize=4, fmt="none")
         ax.text(i, p + 0.02, f"{p:.2f}", ha="center", fontsize=10)
     ax.set_xticks(range(len(CONFIGS)))
-    ax.set_xticklabels([LABELS[c] for c in CONFIGS], rotation=12)
+    ax.set_xticklabels([LABELS[c] for c in CONFIGS], rotation=14, fontsize=8)
     ax.set_ylim(0, 1.05)
-    ax.set_ylabel("exact-match accuracy")
-    ax.set_title(f"GSM8K (n={data[BASELINE]['gsm8k']['n']}, greedy, 95% Wilson CI)")
+    ax.set_ylabel("exact-match accuracy (numeric grading)")
+    ax.set_title(f"GSM8K (n={gsm_n}, greedy, 95% Wilson CI)")
     figs["gsm8k"] = fig_to_svg(fig)
 
     # ---- probe: NLL / agreement / KL vs position ----
     base_probe = data[BASELINE]["probe"]
-    kl_fn = make_kl_fn(base_probe) if base_probe else None
-    for name, key_fn, ylab, title in [
+    specs = [
         ("probe_nll", lambda st, row: st["nll"], "NLL of reference token (nats)",
-         "Reference-trajectory NLL vs decode position (bucket = 16)"),
+         "Reference-trajectory NLL vs decode position (bucket = 16)", False),
         ("probe_agree", top1_agree, "top-1 agreement with reference",
-         "Greedy agreement with the bf16 reference vs decode position"),
-        ("probe_kl", kl_fn, "approx KL(base ‖ config), nats",
-         "Truncated KL to baseline (top-5) vs decode position"),
-    ]:
-        if key_fn is None:
-            continue
+         "Greedy agreement with the bf16 reference vs decode position", False),
+    ]
+    if base_probe:
+        specs.append(
+            ("probe_kl", make_k3_fn(base_probe), "KL(base ‖ config), k3 estimator (nats)",
+             "KL to baseline on shared reference tokens vs decode position", True)
+        )
+    for name, key_fn, ylab, title, skip_baseline in specs:
         fig, ax = plt.subplots(figsize=(7.6, 3.6))
         for c in CONFIGS:
             probe = data[c]["probe"]
             if not probe:
                 continue
-            if name == "probe_kl" and c == BASELINE:
+            if skip_baseline and c == BASELINE:
                 continue
             xs, ys = probe_series(probe, key_fn)
-            ax.plot(xs, ys, label=LABELS[c], color=COLORS[c], marker="o", ms=3, lw=1.6)
+            ax.plot(xs, ys, label=LABELS[c], color=COLORS[c],
+                    linestyle=LINESTYLES[c], marker="o", ms=3, lw=1.6)
         ax.set_xlabel("decode position k in the 256-token continuation")
         ax.set_ylabel(ylab)
         ax.set_title(title)
@@ -229,7 +244,8 @@ def build(data, out_path, commit):
                 else None
             )
         if d["gsm8k"]:
-            row["acc"] = d["gsm8k"]["accuracy"]
+            row["acc"] = gsm8k_accuracy(d["gsm8k"])
+            row["acc_string_graded"] = d["gsm8k"]["accuracy"]
         if d["probe"]:
             xs, ys = probe_series(d["probe"], top1_agree)
             row["agree_first"] = ys[0] if ys else None
@@ -299,6 +315,14 @@ thead th {{ background:var(--surface); font-size:.72rem; text-transform:uppercas
 <h1>8-bit Activations on the Pipeline Wire</h1>
 <p class="note">Qwen/Qwen3.6-35B-A3B · 4× RTX 5090 · sglang dev @ <span class="mono">{commit}</span> · run 2026-08-21</p>
 <!--NARRATIVE_INTRO-->
+<h2>Wire format</h2>
+<div style="overflow-x:auto"><table><thead><tr>
+<th>wire</th><th>payload per token per tensor (H=2048)</th><th>+ scale</th><th>per boundary (2 tensors)</th><th>compression</th>
+</tr></thead><tbody>
+<tr><td>bf16 (stock)</td><td>4,096 B</td><td>—</td><td>8,192 B</td><td>1.00×</td></tr>
+<tr><td>int8 + f32/token scale</td><td>2,048 B</td><td>4 B</td><td>4,104 B</td><td>2.00×</td></tr>
+<tr><td>int4 (packed) + f32/token scale</td><td>1,024 B</td><td>4 B</td><td>2,056 B</td><td>3.98×</td></tr>
+</tbody></table></div>
 <h2>Headline table</h2>
 <div style="overflow-x:auto"><table><thead><tr>
 <th>config</th><th>pp</th><th>tp</th><th>wikitext NLL</th><th>PPL</th><th>ΔNLL vs base</th><th>GSM8K acc</th><th>agree k∈[0,16)</th><th>agree k∈[240,256)</th><th>TTFT ms</th><th>out tok/s</th>

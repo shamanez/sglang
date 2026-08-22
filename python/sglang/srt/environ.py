@@ -579,12 +579,9 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
-    # PP: quantize the inter-stage activation wire format (the "proxy" ring only;
-    # the output ring is untouched) to 8-bit with per-token float32 scales.
-    # Values: "int8" (symmetric absmax) or "fp8" (e4m3, shipped as uint8 since
-    # NCCL has no fp8 dtype). Quantize-before-send / dequantize-after-recv in
-    # scheduler_pp_mixin, so the model and CUDA graphs always see the model
-    # dtype. Lossy on the wire; research knob, default off.
+    # PP: lossy wire format for inter-stage activations (proxy ring only), with
+    # per-token scales: "int8", "fp8" (CUDA/MUSA only), or "int4". Compute
+    # stays in model dtype; ignored when pp_size == 1.
     SGLANG_PP_ACTIVATION_WIRE_QUANT = EnvStr(None)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
