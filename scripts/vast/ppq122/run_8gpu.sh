@@ -65,10 +65,13 @@ stage1() {
     export PPQ_REFERENCE_PATH="$PPQ8/reference_trajectories_1024.json"
     export PROBE_LEN=1024
     mkdir -p "$PPQ_RESULTS_DIR"
-    STAGES=probe MAKE_REFERENCE=1 SKIP_BENCH=1 run lp_pp8_bf16 none 8 1
+    # Scoring a ~1300-token sequence materializes a [T, 248k-vocab] fp32 logprob
+    # transient outside the static pool; it needs allocator headroom, not KV.
+    LP_ARGS=(--mem-fraction-static 0.75 --disable-cuda-graph)
+    STAGES=probe MAKE_REFERENCE=1 SKIP_BENCH=1 run lp_pp8_bf16 none 8 1 "${LP_ARGS[@]}"
     for cfg in "lp_pp8_int8 int8" "lp_pp8_int4 int4" "lp_pp8_mxfp4 mxfp4" "lp_pp8_nvfp4 nvfp4"; do
         set -- $cfg
-        STAGES=probe SKIP_BENCH=1 run "$1" "$2" 8 1
+        STAGES=probe SKIP_BENCH=1 run "$1" "$2" 8 1 "${LP_ARGS[@]}"
     done
     unset PROBE_LEN PPQ_REFERENCE_PATH
     export PPQ_RESULTS_DIR="$PPQ8/results"
