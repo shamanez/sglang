@@ -91,11 +91,29 @@ multimodal embed routine, and handling 8 MTP layers — days of model work, out 
 
 ---
 
+## Stage 4 — 122B native-bf16 at pp8/tp1: the weight-precision control (fit attempt)
+
+Reinstated from "dropped" after a closer look at the arithmetic. 227.3 GiB of bf16
+weights vs 254.7 GiB total VRAM leaves ~3.4 GiB/GPU on average — tight but not
+impossible, because **KV is nearly free on this model**: hybrid-GDN means only 12 of
+48 layers carry KV (~24.6 KB/token model-wide), and the eval needs ≤4k contexts at
+concurrency ≤4, i.e. a few hundred MB. The server is launched with a starved KV
+budget (`--context-length 4096 --max-running-requests 4 --disable-cuda-graph`),
+which costs nothing we need — generation speed is unaffected; only concurrency and
+context are capped. Escalation if rank 0 (embeddings + vision tower) or the last
+rank (lm_head + logprob spike) exceeds its 31.85 GiB ceiling:
+`SGLANG_PP_LAYER_PARTITION=5,6,7,6,6,6,7,5` sheds a ~4.5 GiB layer from each end.
+
+If it serves: `q122bf16_pp8_{bf16,int8,int4,mxfp4,nvfp4}` (wikitext + GSM8K, no
+bench). Scientific value: same model, same depth, bf16 vs FP8 **weights** × wire
+codecs — isolates whether weight precision interacts with wire compression, which
+de-confounds the stage 2 replication. If both fit attempts fail, it is dropped for
+real, with the failure logged.
+
 ## Explicitly dropped
 
 | item | why |
 |---|---|
-| 122B **bf16** (244 GB) | exceeds 256 GB total once KV cache and CUDA contexts are counted; FP8 is the only viable variant |
 | CPU-offload paths | upstream bug for this model family — device mismatch in the Gemma-layernorm weight loader (`layers/layernorm.py:1073`). Not needed at 8 GPUs; worth an upstream issue, not a workaround |
 | pp2 1024-step probe | OOMs in the scoring path at 20 layers/stage; stage 1b covers the long-horizon question at pp8 instead |
 
