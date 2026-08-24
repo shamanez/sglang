@@ -620,7 +620,7 @@
           </li>
           <li class="flash-item">
             <span class="flash-label">Quality checks</span>
-            <p><strong>WikiText NLL and GSM8K answer accuracy test different failure modes.</strong> NLL detects small distribution shifts. GSM8K tests whether greedy generated answers remain correct. Each GSM8K cell is one greedy pass, at temperature 0, over the same first 100 questions of the test split, graded by numeric match.</p>
+            <p><strong>WikiText NLL and GSM8K answer accuracy test different failure modes.</strong> NLL is the mean negative log likelihood per token, measured teacher forced: the model scores the true next token at every position given the true prefix, so no text is generated and no sampling is involved. Each cell covers 24,576 tokens, being 24 non-overlapping 1,024 token windows from the WikiText-2 raw test split, and the tables report the change relative to the matching BF16 control, where lower is better. The measurement is deterministic to the last floating point digit on this stack, which is what makes changes well below a tenth of a percent readable: the same configuration re-run three weeks later on a different machine returned a value identical in all 17 significant digits. NLL detects small distribution shifts that leave greedy answers intact. GSM8K tests whether greedy generated answers remain correct. Each GSM8K cell is one greedy pass, at temperature 0, over the same first 100 questions of the test split, graded by numeric match.</p>
           </li>
           <li class="flash-item">
             <span class="flash-label">System support</span>
