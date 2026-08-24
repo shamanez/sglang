@@ -22,10 +22,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-WIRES = ["bf16", "int8", "mxfp8", "int4", "mxfp4", "nvfp4"]
+WIRES = ["bf16", "int8", "fp8", "mxfp8", "int4", "mxfp4", "nvfp4"]
 COLORS = {
     "bf16": "#5C6470",
     "int8": "#0E6B5E",
+    "fp8": "#1F7A8C",
     "mxfp8": "#5B3E96",
     "int4": "#B3271E",
     "mxfp4": "#C4A000",
@@ -174,7 +175,7 @@ def fig_longprobe(data: Path):
     ppq8 = data / "ppq8" / "results_longprobe"
     fig, ax = plt.subplots(figsize=(6.4, 4.0))
     any_series = False
-    for wire in ["bf16", "int8", "nvfp4", "mxfp4", "int4"]:
+    for wire in ["bf16", "int8", "fp8", "mxfp8", "nvfp4", "mxfp4", "int4"]:
         seg = probe_segments(ppq8 / f"lp2_pp8_{wire}" / "probe.json", 8)
         if not seg:
             continue
