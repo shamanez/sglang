@@ -343,10 +343,6 @@
     details { margin-top: 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
     summary { cursor: pointer; padding: 15px 18px; font-weight: 800; }
     details > div { padding: 0 18px 18px; }
-    .appendix-details { margin-top: clamp(48px, 7vw, 76px); border-radius: 12px; }
-    .appendix-details > summary { padding: 20px 22px; font-size: 18px; }
-    .appendix-details > summary span { display: block; color: var(--muted); font-size: 13px; font-weight: 500; }
-    .appendix-details > div { padding: 0 22px 24px; }
     code { padding: 1px 5px; border-radius: 5px; background: var(--wash); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
     pre { margin: 12px 0 0; padding: 14px; overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); font-size: 12px; }
 
@@ -467,7 +463,6 @@
         <a href="#design">Experiment design</a>
         <a href="#quality">Quality and scale</a>
         <a href="#time">Decode horizon</a>
-        <a href="#latency-appendix">Latency appendix</a>
       </nav>
 
       <section class="report-section" id="mechanism">
@@ -872,72 +867,6 @@
           <p><strong>What this supports.</strong> Additional pipeline boundaries can amplify coarse quantization error inside one forward pass. The tested frozen trajectories show no progressive representational drift across decode position. Because the probe is teacher-forced, it does not prove that every free-running generation will remain identical. GSM8K provides the separate free-running task check.</p>
         </div>
       </section>
-
-      <details class="appendix-details" id="latency-appendix">
-        <summary>Appendix · Latency and implementation results<span>Optional evidence. Open to show TTFT and inter-token latency measurements.</span></summary>
-        <div>
-          <p>The main report focuses on communication volume and quality. These measurements are retained as implementation evidence because codec fusion, launch overhead, and the local interconnect strongly affect them.</p>
-
-          <figure class="figure" aria-labelledby="ttft-title">
-            <div class="figure-head">
-              <div>
-                <h3 id="ttft-title">Median TTFT change relative to BF16</h3>
-                <p>Negative values are faster. Results come from 48 prompts with 1,024 input tokens, 256 output tokens, and concurrency 16.</p>
-              </div>
-              <span class="pill direction-down">↓ lower is better · negative is faster</span>
-            </div>
-            <div class="chart-host" id="ttft-chart"></div>
-            <div class="legend" aria-label="TTFT chart legend">
-              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--green)">●</span>INT8</span>
-              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--purple)">▲</span>MXFP8</span>
-              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--amber)">◆</span>MXFP4</span>
-              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--magenta)">⬟</span>NVFP4</span>
-              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--blue)">■</span>FP8 (1 and 3 boundaries)</span>
-            </div>
-            <figcaption class="sr-only">INT8 reduces median TTFT by about 23%, 21%, and 6% at one, three, and seven boundaries. The other formats show the same pattern of diminishing benefit with depth. FP8 appears at one and three boundaries only, at -1.0% and -20.8%; its seven-boundary run was made on a different host and is reported in the note below rather than plotted here.</figcaption>
-          </figure>
-
-          <div class="table-wrap" style="margin-top: 22px">
-            <table>
-              <caption>Median inter-token latency change relative to the matching BF16 run. Positive values are slower.</caption>
-              <thead>
-                <tr><th>Format</th><th class="num">1 boundary</th><th class="num">3 boundaries</th><th class="num">7 boundaries</th><th>Interpretation</th></tr>
-              </thead>
-              <tbody>
-                <tr><th>INT8</th><td class="num">+3.5%</td><td class="num">+3.3%</td><td class="num">+6.3%</td><td>Fused codec keeps decode overhead modest.</td></tr>
-                <tr><th>MXFP8</th><td class="num">+9.0%</td><td class="num">+6.0%</td><td class="num">+9.7%</td><td>Microscale handling adds launch work.</td></tr>
-                <tr><th>FP8</th><td class="num">+3.9%</td><td class="num">+2.5%</td><td class="num">n/a</td><td>Per-token float codec, close to INT8. Seven-boundary cell measured on a different host, see note.</td></tr>
-                <tr><th>MXFP4</th><td class="num">+37.8%</td><td class="num">+37.1%</td><td class="num">+22.7%</td><td>Eager E2M1 operations dominate decode.</td></tr>
-                <tr><th>NVFP4</th><td class="num">+10.3%</td><td class="num">+11.7%</td><td class="num">+24.2%</td><td>The 16-value scale structure needs a fused path.</td></tr>
-              </tbody>
-            </table>
-          </div>
-
-          <details>
-            <summary>Raw benchmark medians</summary>
-            <div class="table-wrap">
-              <table>
-                <caption>Each cell shows median TTFT followed by median ITL in milliseconds.</caption>
-                <thead><tr><th>Format</th><th class="num">1 boundary</th><th class="num">3 boundaries</th><th class="num">7 boundaries</th></tr></thead>
-                <tbody>
-                  <tr><th>BF16</th><td class="num">406 · 13.40</td><td class="num">297 · 17.48</td><td class="num">193 · 22.15</td></tr>
-                  <tr><th>INT8</th><td class="num">312 · 13.88</td><td class="num">234 · 18.05</td><td class="num">181 · 23.54</td></tr>
-                  <tr><th>MXFP8</th><td class="num">317 · 14.61</td><td class="num">246 · 18.53</td><td class="num">188 · 24.31</td></tr>
-                  <tr><th>FP8</th><td class="num">402 · 13.92</td><td class="num">235 · 17.92</td><td class="num">n/a</td></tr>
-                  <tr><th>INT4</th><td class="num">380 · 14.17</td><td class="num">242 · 18.39</td><td class="num">191 · 24.81</td></tr>
-                  <tr><th>MXFP4</th><td class="num">406 · 18.46</td><td class="num">279 · 23.97</td><td class="num">193 · 27.18</td></tr>
-                  <tr><th>NVFP4</th><td class="num">365 · 14.78</td><td class="num">247 · 19.53</td><td class="num">189 · 27.52</td></tr>
-                </tbody>
-              </table>
-            </div>
-          </details>
-          <p class="note"><strong>Latency is host dependent, quality is not.</strong> Every latency cell above was measured on one host. The seven-boundary FP8 run was made later on a second eight-GPU host, where the identical BF16 control measured 323 ms median TTFT against 193 ms on the first, a 68% difference for the same settings, while median ITL moved only +0.7%. Prefill time across seven pipeline boundaries depends on host PCIe topology, so FP8 is left blank at seven boundaries rather than compared against another machine's baseline. Measured against its own same-host control, FP8 at seven boundaries records -33.7% median TTFT and +6.8% median ITL. Quality metrics are unaffected: teacher-forced NLL reproduced bit for bit across the two hosts.</p>
-
-          <div class="callout caution">
-            <p><strong>Implementation reading.</strong> INT8 uses a fused Triton path. MXFP4 and NVFP4 use eager PyTorch operations, so their measured overhead is not an intrinsic cost of the formats.</p>
-          </div>
-        </div>
-      </details>
     </main>
 
     <footer>
@@ -1358,25 +1287,6 @@
         ]
       };
 
-      const ttftConfig = {
-        label: "Median time to first token change relative to BF16",
-        xValues: [1, 3, 7],
-        xTitle: "Pipeline boundaries per forward pass",
-        yTitle: "TTFT change (%)",
-        xFormat: value => String(value),
-        xTooltip: value => `${value} ${value === 1 ? "boundary" : "boundaries"}`,
-        yDomain: [-25, 5],
-        yTicks: [-25, -20, -15, -10, -5, 0, 5],
-        yFormat: value => `${value}%`,
-        tooltipFormat: value => `${formatNumber(value, 1)}% TTFT change`,
-        series: [
-          { key: "int8", label: "INT8", values: [{ x: 1, y: -23.05 }, { x: 3, y: -21.15 }, { x: 7, y: -6.12 }] },
-          { key: "mxfp8", label: "MXFP8", values: [{ x: 1, y: -21.91 }, { x: 3, y: -16.98 }, { x: 7, y: -2.45 }] },
-          { key: "mxfp4", label: "MXFP4", values: [{ x: 1, y: -0.02 }, { x: 3, y: -5.87 }, { x: 7, y: 0.14 }] },
-          { key: "nvfp4", label: "NVFP4", values: [{ x: 1, y: -10.12 }, { x: 3, y: -16.67 }, { x: 7, y: -1.71 }] },
-          { key: "fp8", label: "FP8", values: [{ x: 1, y: -1.0 }, { x: 3, y: -20.83 }] }
-        ]
-      };
 
       const renderers = [
         ["payload-chart", () => drawHorizontalBars("payload-chart", payloadData)],
@@ -1399,8 +1309,7 @@
         ["gsm35-8bit-chart", () => drawGroupedBars("gsm35-8bit-chart", gsm35EightBitConfig)],
         ["gsm122-chart", () => drawGroupedBars("gsm122-chart", gsm122Config)],
         ["time-safe-chart", () => drawLineChart("time-safe-chart", timeSafeConfig)],
-        ["time-int4-chart", () => drawLineChart("time-int4-chart", timeInt4Config)],
-        ["ttft-chart", () => drawLineChart("ttft-chart", ttftConfig)]
+        ["time-int4-chart", () => drawLineChart("time-int4-chart", timeInt4Config)]
       ];
 
       const rendererIsVisible = id => {
@@ -1423,14 +1332,6 @@
         if (host) observer.observe(host);
       });
 
-      const latencyAppendix = document.getElementById("latency-appendix");
-      if (latencyAppendix) {
-        latencyAppendix.addEventListener("toggle", () => {
-          if (!latencyAppendix.open) return;
-          const match = renderers.find(([id]) => id === "ttft-chart");
-          if (match) match[1]();
-        });
-      }
 
       const themeObserver = new MutationObserver(() => renderers.forEach(([id, render]) => {
         if (rendererIsVisible(id)) render();

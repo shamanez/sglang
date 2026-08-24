@@ -18,9 +18,9 @@ SRC = Path("reports/pipeline-activation-wire-compression-report.html")
 SITE = Path.home() / "Documents/efficient-inference"
 SLUG = "initial-activation-boundary-quantization"
 TITLE = "Initial Activation Boundary Quantization"
-DESC = ("Measured quality and latency cost of quantizing only the activations sent across "
-        "pipeline-parallel stage boundaries, for INT8, FP8, MXFP8, INT4, MXFP4 and NVFP4, "
-        "at one, three and seven boundaries on a 35B and a 122B model.")
+DESC = ("Measured quality cost of quantizing only the activations sent across pipeline-parallel "
+        "stage boundaries, for INT8, FP8, MXFP8, INT4, MXFP4 and NVFP4, at one, three and seven "
+        "boundaries on a 35B and a 122B mixture of experts model.")
 KICKER = "Experiment report"
 
 
@@ -31,9 +31,9 @@ def card(date, n_formats, n_depths):
           <p>Quantizing only the tensors that cross pipeline-parallel stage boundaries, leaving weights,
             KV cache and compute untouched. {n_formats} wire formats measured at {n_depths} pipeline depths on a
             35B mixture of experts model and a 122B model with FP8 weights, scored by teacher-forced
-            WikiText NLL, GSM8K accuracy, a 1,024 step decode-position probe, and serving latency.
-            Covers where 8-bit is free, why per-token INT4 collapses while microscaled 4-bit survives,
-            and why the scale format rather than the block size separates MXFP4 from NVFP4.</p>
+            WikiText NLL, GSM8K accuracy, and a 1,024 step decode-position probe. Covers which 8-bit
+            format holds once the model is large, why per-token INT4 collapses while microscaled 4-bit
+            survives, and why the scale format rather than the block size separates MXFP4 from NVFP4.</p>
         </a>
 '''
 
