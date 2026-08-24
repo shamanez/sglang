@@ -71,6 +71,15 @@ def collect(data: Path):
     out["seg_fp8"] = segments(lp / f"lp2_pp8_{WIRE}/probe.json")
     out["seg_mxfp8"] = segments(lp / "lp2_pp8_mxfp8/probe.json")
 
+    # Same-host latency control, for the host-dependence note.
+    ctl = bench(ppq8 / "results/ctl_pp8_bf16")
+    ref = bench(ppq8 / "results/pp8_bf16")
+    fp8b = bench(ppq8 / f"results/pp8_{WIRE}")
+    out["ctl_ttft"], out["ctl_itl"] = ctl["median_ttft_ms"], ctl["median_itl_ms"]
+    out["ref_ttft"], out["ref_itl"] = ref["median_ttft_ms"], ref["median_itl_ms"]
+    out["ttft7_same"] = (fp8b["median_ttft_ms"] / ctl["median_ttft_ms"] - 1) * 100
+    out["itl7_same"] = (fp8b["median_itl_ms"] / ctl["median_itl_ms"] - 1) * 100
+
     # Control: did this box reproduce the anchor the deltas are computed against?
     ctl = ppq8 / "results/ctl_pp8_bf16/wikitext.json"
     out["control_nll"] = read_json(ctl)["mean_nll"] if ctl.exists() else None
@@ -112,11 +121,17 @@ def edits(v):
         f'          {{ key: "mxfp8", label: "MXFP8", values: {series_literal(v["seg_mxfp8"])}.map((y, i) => ({{ x: i + 1, y }})) }}\n',
         "timeSafeConfig: add the fp8 and mxfp8 decode-horizon series",
     ))
+    # Latency, unlike NLL, is NOT host-invariant: the same bf16 pp8 config measured
+    # 192.7 ms TTFT on the host that produced every other row here and 323.2 ms on
+    # the host that produced the new fp8 run, a 67.7% difference for identical
+    # settings. So fp8 is plotted only at the depths measured on the original host;
+    # its 7-boundary latency is reported in a note against its own same-host control
+    # rather than dropped into a column whose baseline is a different machine.
     E.append((
         '          { key: "nvfp4", label: "NVFP4", values: [{ x: 1, y: -10.12 }, { x: 3, y: -16.67 }, { x: 7, y: -1.71 }] }\n',
         '          { key: "nvfp4", label: "NVFP4", values: [{ x: 1, y: -10.12 }, { x: 3, y: -16.67 }, { x: 7, y: -1.71 }] },\n'
-        f'          {{ key: "fp8", label: "FP8", values: [{{ x: 1, y: {v["ttft1"]} }}, {{ x: 3, y: {v["ttft3"]} }}, {{ x: 7, y: {v["ttft7"]} }}] }}\n',
-        "ttftConfig: add fp8 at all three depths (1 and 3 were measured, never plotted)",
+        f'          {{ key: "fp8", label: "FP8", values: [{{ x: 1, y: {v["ttft1"]} }}, {{ x: 3, y: {v["ttft3"]} }}] }}\n',
+        "ttftConfig: add fp8 at 1 and 3 boundaries (measured on this chart's host)",
     ))
 
     # --- tables -----------------------------------------------------------
@@ -124,18 +139,38 @@ def edits(v):
         '<tr><th>MXFP8</th><td class="num">+9.0%</td><td class="num">+6.0%</td><td class="num">+9.7%</td><td>Microscale handling adds launch work.</td></tr>',
         '<tr><th>MXFP8</th><td class="num">+9.0%</td><td class="num">+6.0%</td><td class="num">+9.7%</td><td>Microscale handling adds launch work.</td></tr>\n'
         f'                <tr><th>FP8</th><td class="num">{v["itl1"]:+.1f}%</td><td class="num">{v["itl3"]:+.1f}%</td>'
-        f'<td class="num">{v["itl7"]:+.1f}%</td><td>Per-token float codec, close to INT8.</td></tr>',
+        '<td class="num">n/a</td><td>Per-token float codec, close to INT8. Seven-boundary cell measured on a different host, see note.</td></tr>',
         "ITL table: add the FP8 row",
     ))
     E.append((
         '<tr><th>MXFP8</th><td class="num">317 · 14.61</td><td class="num">246 · 18.53</td><td class="num">188 · 24.31</td></tr>',
         '<tr><th>MXFP8</th><td class="num">317 · 14.61</td><td class="num">246 · 18.53</td><td class="num">188 · 24.31</td></tr>\n'
         f'                  <tr><th>FP8</th><td class="num">{v["raw1"]}</td><td class="num">{v["raw3"]}</td>'
-        f'<td class="num">{v["raw7"]}</td></tr>',
+        '<td class="num">n/a</td></tr>',
         "raw medians table: add the FP8 row",
     ))
 
     # --- prose that asserts the gap --------------------------------------
+    E.append((
+        "                <caption>Each cell shows median TTFT followed by median ITL in milliseconds.</caption>",
+        "                <caption>Each cell shows median TTFT followed by median ITL in milliseconds.</caption>",
+        "raw medians caption (anchor only, kept verbatim)",
+    ))
+    E.append((
+        "          </details>\n",
+        "          </details>\n"
+        "          <p class=\"note\"><strong>Latency is host dependent, quality is not.</strong> "
+        "Every latency cell above was measured on one host. The seven-boundary FP8 run was made later on a "
+        "second eight-GPU host, where the identical BF16 control measured "
+        f"{v['ctl_ttft']:.0f} ms median TTFT against {v['ref_ttft']:.0f} ms on the first, a "
+        f"{(v['ctl_ttft']/v['ref_ttft']-1)*100:.0f}% difference for the same settings, while median ITL moved only "
+        f"{(v['ctl_itl']/v['ref_itl']-1)*100:+.1f}%. Prefill time across seven pipeline boundaries depends on host "
+        "PCIe topology, so FP8 is left blank at seven boundaries rather than compared against another machine's "
+        f"baseline. Measured against its own same-host control, FP8 at seven boundaries records "
+        f"{v['ttft7_same']:+.1f}% median TTFT and {v['itl7_same']:+.1f}% median ITL. Quality metrics are unaffected: "
+        "teacher-forced NLL reproduced bit for bit across the two hosts.</p>\n",
+        "latency appendix: note the host dependence and give the same-host FP8 figures",
+    ))
     E.append((
         "E4M3 floating-point values with one FP32 scale per token. It was tested at one and three boundaries.",
         "E4M3 floating-point values with one FP32 scale per token. It was tested at one, three, and seven boundaries.",
