@@ -37,13 +37,20 @@ rsync -av -e "$RSH" \
     "root@$HOST:$PPQ9/results_longprobe/lp2_pp8_mxfp8" \
     "$DATA/ppq8/results_longprobe/"
 
-say "replicates -> replicates/"
-mkdir -p "$DATA/replicates"
-rsync -av -e "$RSH" \
-    "root@$HOST:$PPQ9/results_replicates/rep2_pp4_int8" \
-    "root@$HOST:$PPQ9/results_replicates/rep2_pp4_fp8" \
-    "root@$HOST:$PPQ9/results_replicates/rep2_pp4_mxfp8" \
-    "$DATA/replicates/"
+# Only present if stage 3 was run. Under the default `html` target it is not, and
+# rsync exits 23 on a missing source - which under set -e would abort the fetch
+# before the logs and the report rebuild.
+say "replicates -> replicates/ (stage 3 only)"
+if $RSH "root@$HOST" "[ -d $PPQ9/results_replicates/rep2_pp4_int8 ]" 2>/dev/null; then
+    mkdir -p "$DATA/replicates"
+    rsync -av -e "$RSH" \
+        "root@$HOST:$PPQ9/results_replicates/rep2_pp4_int8" \
+        "root@$HOST:$PPQ9/results_replicates/rep2_pp4_fp8" \
+        "root@$HOST:$PPQ9/results_replicates/rep2_pp4_mxfp8" \
+        "$DATA/replicates/"
+else
+    echo "   none on the box (stage 3 not run) - skipping"
+fi
 
 say "logs"
 $RSH "root@$HOST" "tar czf - -C $PPQ9 logs" > "$DATA/ppq9_logs.tar.gz"
@@ -60,7 +67,9 @@ say "regenerate the report section"
 python3 "$REPO/scripts/vast/ppq122/build_8gpu_section.py" --data "$DATA"
 
 say "landed"
-find "$DATA/ppq8/results/pp8_fp8" "$DATA/ppq8/results/ctl_pp8_bf16" \
-     "$DATA/ppq8/results_longprobe/lp2_pp8_fp8" "$DATA/ppq8/results_longprobe/lp2_pp8_mxfp8" \
-     "$DATA/replicates/rep2_pp4_int8" "$DATA/replicates/rep2_pp4_fp8" \
-     "$DATA/replicates/rep2_pp4_mxfp8" -type f 2>/dev/null | sed "s|$DATA/|   |"
+for d in "$DATA/ppq8/results/pp8_fp8" "$DATA/ppq8/results/ctl_pp8_bf16" \
+         "$DATA/ppq8/results_longprobe/lp2_pp8_fp8" "$DATA/ppq8/results_longprobe/lp2_pp8_mxfp8" \
+         "$DATA/replicates/rep2_pp4_int8" "$DATA/replicates/rep2_pp4_fp8" \
+         "$DATA/replicates/rep2_pp4_mxfp8"; do
+    [ -d "$d" ] && find "$d" -type f | sed "s|$DATA/|   |"
+done

@@ -1,131 +1,98 @@
 # Gap-fill run queue — 8x RTX 5090
 
-Three holes in the published 35B matrix, all of them the per-token **fp8** and
-microscaled **mxfp8** wires at depth. Ordered highest-value-first, so partial box
-time still buys the best science. Driver: `run_gapfill.sh [stage0|stage1|stage2|stage3|all]`.
+Scoped to one question: **what does `reports/pipeline-activation-wire-compression-report.html`
+need that no measurement exists for?** Verified by a 9-agent audit (5 independent inventories,
+3 adversarial refutation attempts, 1 completeness critic) over all four report HTMLs, the
+archived data tree, both probe tarballs, both log tarballs, and the full git object graph.
 
-| gap | what is missing | stage |
-|---|---|---|
-| core quality grid | fp8 at 7 boundaries — the only empty cell in the 1/3/7-boundary matrix | 1 |
-| 1024-step decode probe | fp8 and mxfp8 at 7 boundaries | 2 |
-| independent replication | int8, fp8, mxfp8 at 3 boundaries (round 2 covered only bf16, int4, mxfp4, nvfp4) | 3 |
+Driver: `run_gapfill.sh [html|stage0|stage1|stage2|stage3|all]`, default `html`.
 
----
+## The answer: 3 runs, not 7
 
-## Before anything: the two things that make the numbers comparable
+The report draws every figure at runtime from JS config objects — there is no inline `<svg>` —
+so a missing cell is a missing array element, and they are enumerable exactly.
 
-**1. Frozen references.** Every 35B row in the report scores against one frozen set
-of reference trajectories. `bootstrap_gapfill.sh` copies them out of the repo
-(`reports/data/reference_trajectories_256.json` and `..._1024_pp8.json`) into the
-results root. Regenerating them on the new box would produce a self-consistent set
-of numbers that cannot be put in the same table as the published ones.
+| # | stage | label | what it fills | ~time |
+|---|---|---|---|---|
+| 1 | 0 | `ctl_pp8_bf16` | nothing — baseline validity check, see below | 20 m |
+| 2 | 1 | `pp8_fp8` | `depthSafeConfig` fp8 `x:7`, `gsm35EightBitConfig` fp8 `x:7`, `ttftConfig` fp8@7, both latency tables @7 | 25 m |
+| 3 | 2 | `lp2_pp8_fp8` | `timeSafeConfig` fp8 series | 25 m |
+| 4 | 2 | `lp2_pp8_mxfp8` | `timeSafeConfig` mxfp8 series | 25 m |
 
-**2. The runtime is byte-identical.** The archived pp8 results carry
-`version 0.0.0.dev16932+ga62276c35`, and `git diff a62276c35 HEAD -- python/` is
-empty — every commit on this branch since then has touched only `reports/` and
-`scripts/`. So building branch HEAD reproduces the exact code that produced them.
-`bootstrap_gapfill.sh` re-checks this on the box and warns if `python/` has moved,
-rather than trusting a pinned hash that any later commit would invalidate.
+The report **already annotates the largest of these gaps itself**: `L1132` carries the chart
+label `"FP8 not run at 7 boundaries"`, `L649` says so in prose, `L680` in the figcaption. Run 2
+is what lets those three disclaimers be deleted.
 
----
+## Dropped: the round-2 replicates
 
-## Stage 0 — box reproducibility control (`ctl_pp8_bf16`, ~20 min)
+`rep2_pp4_{int8,fp8,mxfp8}` are **not** in the default target. This report has **no replication,
+variance or reproducibility section at all** — the audit scanned for `replicat`, `reproduc`,
+`variance`, `re-run`, `rerun`, `independent`, `second run`, `rep2`, `seed`, `twice`, `run-to-run`,
+`error bar`, `standard deviation` and found nothing. Its only uncertainty figure is an analytic
+Wilson binomial interval on the n=100 GSM8K sample (`wilsonInterval(percent, n = 100, z = 1.96)`,
+`L934`), which is within-run sampling error, not run-to-run variance.
 
-**Why this runs first.** The new cells are measured on a new physical box, but every
-delta they feed is against anchors from a box that no longer exists. bf16
-teacher-forced NLL is bit-deterministic on this stack — pp4 and pp8, four separate
-servers, all returned `1.8932072605675765` to the last digit — so re-measuring it is
-a 20-minute test of whether that determinism survives the box change.
+The replication *table* lives in the older `reports/pp_wire_quant_report.html` (line 6429,
+pp4 only, bf16/int4/mxfp4/nvfp4). If that file is the target, run `all` instead of `html` and
+the three replicates come back — worth doing on the science, since round 2 replicated every
+format whose result was dramatic and none whose result was "no effect".
 
-- **bit-identical** → every new cell drops straight into the published tables.
-- **drift** → the new cells are read against *this* control, and the report says so.
-  Not a failure; the runs stay valid. The driver warns, writes
-  `control_verdict.json`, and continues.
+## Stage 0 is not a cell, and still earns its 20 minutes
 
-GSM8K also re-measures the accuracy resolution (archived control: 96%; decode
-batching nondeterminism moves this ±1 point, which is the practical floor on any
-accuracy claim).
+Every filled cell is plotted as **% change vs the BF16 control**, and that control
+(`1.8932072605675765`) was measured on a box that no longer exists. If this box disagrees,
+stage 1's fp8 point is drawn against the wrong baseline — the chart goes quietly wrong rather
+than visibly empty, which is worse than the gap it fixes.
 
-Skippable with `SKIP_CONTROL=1`. Not recommended — it is the cheapest stage and it
-is what licenses every comparison after it.
+That number is bit-reproducible on this stack: `main_grid/pp4_bf16` and `ppq8/results/pp8_bf16`
+report it identically to the last digit, from different servers on different boxes. And
+`git diff a62276c35 HEAD -- python/` is empty, so branch HEAD is byte-identical runtime to what
+produced the archived rows. Stage 0 confirms both in 20 minutes, writes `control_verdict.json`,
+and continues either way — drift does not invalidate the runs, it just means they must be read
+against the new control and the report must say so.
 
-## Stage 1 — `pp8_fp8`, the priority run (~25 min)
+`SKIP_CONTROL=1` skips it.
 
-35B, bf16 weights, **fp8 wire, pp8/tp1 = 7 boundaries**. Full stage set —
-WikiText NLL, GSM8K, 256-step probe, bench_serving — so the row matches the other
-six pp8 rows field for field.
+## Fix these with zero GPU time — already measured, never plotted
 
-fp8's shallower rows were quality-free (**-0.005%** NLL at 1 boundary, **+0.06%** at
-3), and the other two 8-bit wires already hold at 7 (int8 **+0.29%** / 99% GSM8K,
-mxfp8 **+0.08%** / 96%). So the expected result is flat, and that is precisely the
-value: the claim on the table is *no 8-bit format cares about
-pipeline depth*, and fp8 is the one format that has never been asked at depth. A
-flat row completes it; a non-flat row is the most interesting result of the campaign.
+The audit found ~50 cells in this category. The ones that touch the same FP8/MXFP8 story:
 
-Watch also the **TTFT**: at 1–3 boundaries fp8's Triton per-token quant kernel ate
-most of its latency win (402 ms vs mxfp8's 317 ms at pp2), and at 7 boundaries every
-format converged to 181–193 ms. This row says whether fp8 converges with them.
-
-## Stage 2 — long-horizon probe, `lp2_pp8_{fp8,mxfp8}` (~50 min)
-
-1024 decode steps at 7 boundaries, against the same frozen 1024-step references as
-the published `lp2_pp8_*` set (bf16, int8, int4, mxfp4, nvfp4). This is the
-temporal-accumulation instrument: the finding it supports is that temporal
-accumulation *does not exist* at any format or depth, and a negative result is worth
-only as much as its coverage.
-
-Server args `--mem-fraction-static 0.75 --disable-cuda-graph` are **not** a codec
-workaround. Scoring a ~1300-token sequence materializes a `[T, 248k-vocab]` fp32
-logprob transient outside the static pool; at 0.94 the first attempt OOMed inside
-`_row_logsumexp_topk_kernel`. It is a harness scoring-path cost, and it is why the
-pp2 long probes were lost entirely.
-
-## Stage 3 — replication round 2 completion, `rep2_pp4_{int8,fp8,mxfp8}` (~55 min)
-
-3 boundaries, quality only (no bench). Round 2 replicated bf16, int4, mxfp4, nvfp4 —
-that is, every format whose result was *dramatic*, and none of the three whose result
-was *"no effect"*. An unreplicated null result is exactly the kind that quietly turns
-out to be a harness artifact, so these are the replicates that carry the most weight.
-
-pp4/tp1 leaves 4 of the 8 GPUs idle. Running two configs side by side would halve
-this stage, but `run_config.sh` hardcodes port 30000 and `pkill`s every sglang
-process, so it would need per-config ports and device masks. Not worth the risk of
-mislabeling a row for 25 minutes.
-
----
+- **FP8 has no row in either latency table or the TTFT chart at *any* depth**, though
+  `main_grid/pp{2,4}_fp8/bench.jsonl` both exist. Droppable straight in:
+  ITL `+3.9%` / `+2.5%`; raw `402 ms · 13.92` / `235 ms · 17.92`; TTFT `-1.0%` / `-20.9%`.
+  The 1-boundary TTFT is not decorative — it is the only measured case of an 8-bit wire
+  *failing* to win on TTFT (vs INT8's `-23.1%`), and omitting it makes the 8-bit latency story
+  look cleaner than the data.
+- **MXFP8 does have 7-boundary decode-position data** — the 256-step probe, in
+  `ppq8_probe_raw.tar.gz`, reported in no HTML. Segments `0.9805 / 0.9831 / 0.9792 / 0.9883`,
+  the flattest non-BF16 series measured. If a 256-step series is acceptable in that figure,
+  this replaces run 4 for free.
+- **Output throughput at 7 boundaries** exists for all six formats and appears in no HTML
+  (this report has zero occurrences of "throughput"). It matters: NVFP4, the recommended 4-bit
+  format, costs `-16.7%` output throughput at 7 boundaries — *worse* than per-token INT4's
+  `-8.3%`, and the penalty grows with depth.
+- **All 122B latency** (TTFT/ITL/throughput, both depths, 5 formats) is measured and unreported.
 
 ## Operating the box
 
 ```bash
-# 1. on your laptop — the box needs HF_TOKEN for the gated Qwen weights
-scp -i ~/.ssh/vast_ai -P <port> ~/Documents/sglang/.env root@<host>:/workspace/.env
+# 1. from your laptop — provisions secrets, clone and install in one shot
+bash scripts/vast/ppq122/provision_box.sh <ssh-port> <host>
 
-# 2. on the box
-git clone -b research/pp-activation-int8 https://github.com/shamanez/sglang.git /workspace/sglang-src
-bash /workspace/sglang-src/scripts/vast/ppq122/bootstrap_gapfill.sh      # ~45 min
+# 2. start the queue detached (it must outlive the ssh session)
+ssh -i ~/.ssh/vast_ai -p <port> root@<host> \
+  'setsid nohup bash /workspace/sglang-src/scripts/vast/ppq122/run_gapfill.sh html \
+   > /workspace/ppq9/logs/queue.log 2>&1 < /dev/null & echo started'
 
-# 3. detached, or it dies with the ssh session (this cost several reruns last time)
-setsid nohup bash /workspace/sglang-src/scripts/vast/ppq122/run_gapfill.sh all \
-    > /workspace/ppq9/logs/queue.log 2>&1 < /dev/null &
-
-tail -f /workspace/ppq9/logs/queue.log     # ends at GAPFILL_ALL_DONE
-
-# 4. on your laptop, BEFORE destroying the box
+# 3. before destroying the box
 bash scripts/vast/ppq122/fetch_gapfill.sh <port> <host>
 ```
 
-`fetch_gapfill.sh` lands each result at the path `build_8gpu_section.py` already
-reads, splits the raw 256-step `probe.json` into a tarball the way the earlier
-campaigns are archived, and regenerates `reports/data/section_8gpu.html`.
+`provision_box.sh` reads `HF_TOKEN` from `~/.config/verl-research/secrets.env` and ships **only
+that one variable** to the box over stdin — the earlier flow copied the whole `.env`, handing a
+rented third-party machine the Vast API keys, R2 credentials and WANDB key that the run never
+touches.
 
-Budget **~4 h** of box time: ~45 min provisioning, ~2.5 h of runs, slack for one
-retry. Risk is low throughout — model, codecs, harness, and topology are all
-validated; only the box is new, which is what stage 0 measures.
-
-## Deliberately not in this queue
-
-| item | why |
-|---|---|
-| fp8 / mxfp8 on the **122B** | the 122B series was run as bf16/int8/int4/mxfp4/nvfp4 by design — it exists to test the *granularity* mechanism at a larger hidden size, and its 8-bit anchor is int8. Adding fp8 there is a different question (and another ~35 min/config on a checkpoint whose fit is the risky part) |
-| a fused nvfp4 wire kernel | still the highest-value engineering follow-up (the 4-bit codecs are eager-torch emulations paying +12% to +38% ITL), but it is implementation work, not a run |
-| parallel pp4 configs | needs per-config ports and device masks in `run_config.sh`; see stage 3 |
+Budget **~3 h**: ~45 min provisioning, ~1.6 h of runs, slack for one retry. Risk is low —
+model, codecs, harness and topology are all validated; only the box is new, which is exactly
+what stage 0 measures.

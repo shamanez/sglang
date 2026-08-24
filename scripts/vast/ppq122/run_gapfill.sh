@@ -1,15 +1,37 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_gapfill.sh — the cells the 4- and 8-GPU campaigns left empty.
+# run_gapfill.sh — the runs that fill the empty cells in the report HTML.
 #
-# Three holes in the published 35B matrix, all involving the per-token fp8 and
-# microscaled mxfp8 wires at depth:
-#   1. fp8 at 7 boundaries (pp8/tp1) — the only empty cell in the main
-#      1/3/7-boundary quality matrix. HIGHEST PRIORITY.
-#   2. fp8 and mxfp8 in the 1024-step decode probe at 7 boundaries.
-#   3. fp8, mxfp8 and int8 in the round-2 replication at 3 boundaries.
+# Scoped to reports/pipeline-activation-wire-compression-report.html. Every hole
+# in that file traceable to a missing measurement, and nothing else:
 #
-# Usage:  bash run_gapfill.sh [stage0|stage1|stage2|stage3|all]
+#   stage 1  pp8_fp8        -> depthSafeConfig fp8 x:7 (that chart currently
+#                              carries the annotation "FP8 not run at 7
+#                              boundaries" at L1132), gsm35EightBitConfig fp8
+#                              x:7, and the fp8 cells of ttftConfig plus both
+#                              latency tables at 7 boundaries
+#   stage 2  lp2_pp8_fp8    -> timeSafeConfig fp8 series (1024-step probe)
+#            lp2_pp8_mxfp8  -> timeSafeConfig mxfp8 series
+#
+# NOT queued by default, because it fills nothing in that report: the round-2
+# replicates (stage 3). That report has no replication, variance or
+# reproducibility section at all - its only uncertainty figure is an analytic
+# Wilson interval on the n=100 GSM8K sample. The replication TABLE lives in the
+# older reports/pp_wire_quant_report.html; run stage 3 only if that is the target.
+#
+# NEEDS NO GPU AT ALL (already measured, never plotted) - report edits, not runs:
+#   - fp8 has no row in either latency table or the TTFT chart at ANY depth, yet
+#     main_grid/pp{2,4}_fp8/bench.jsonl exist:
+#       ITL  +3.9% (1 bd) / +2.5% (3 bd);  raw 402 ms x 13.92 / 235 ms x 17.92
+#       TTFT -1.0% (1 bd) / -20.9% (3 bd) - the only measured case of an 8-bit
+#       wire failing to win on TTFT, which the report currently cannot show
+#   - mxfp8 DOES have 7-boundary decode-position data: the 256-step probe inside
+#     ppq8_probe_raw.tar.gz, unreported anywhere. Cheaper than stage 2 if a
+#     256-step series is acceptable in that figure.
+#
+# Usage:  bash run_gapfill.sh [html|stage0|stage1|stage2|stage3|all]
+#           html (default) = stage0 + stage1 + stage2, i.e. fill the report
+#           all            = html + stage3 (adds the older report's replicates)
 # Env:    PPQ9=/workspace/ppq9 (results root)
 #         RESTORE_PROD=1  leave a tp4 production server up at the end
 #         SKIP_CONTROL=1  skip stage 0 (not recommended, see below)
@@ -18,7 +40,7 @@
 # without which none of these numbers are comparable to the published rows.
 # =============================================================================
 set -uo pipefail
-STAGE="${1:-all}"
+STAGE="${1:-html}"
 PPQ9="${PPQ9:-/workspace/ppq9}"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PY:-/workspace/venv-sgl/bin/python3}"
@@ -56,9 +78,11 @@ run() {
 }
 
 # ---------------------------------------------------------------- stage 0
-# Box reproducibility control. These are new runs on a NEW physical box, but the
-# deltas they feed are computed against anchors measured on a box that no longer
-# exists. Re-measuring bf16 is 20 minutes and turns that assumption into a fact:
+# Box reproducibility control. The one queued run that does not itself fill a
+# cell, and it is here because the cells that DO get filled are plotted as
+# "% change vs BF16" against a control measured on a box that no longer exists.
+# If this box disagrees, stage 1's fp8 point is drawn against the wrong baseline
+# and the chart goes quietly wrong instead of visibly empty. 20 minutes:
 # if the NLL comes back bit-identical, every new cell drops straight into the
 # published tables; if it drifts, the new cells must be read against THIS
 # control instead, and that has to be stated in the report rather than
@@ -97,8 +121,11 @@ PY
 # three depths; fp8 has 1 and 3. Its 4-GPU rows were quality-free (-0.005% at 1
 # boundary, +0.06% at 3), so the expected result is flat - which is the point:
 # it either completes the "no 8-bit format cares about depth" claim or breaks it.
-# Full stage set, including the 256-step probe and bench, so the row matches the
-# other pp8 rows field for field.
+# Full stage set. The bench is what fills the latency-table and TTFT-chart cells.
+# The 256-step probe fills nothing in the newest report (which has no 256-step
+# probe for any format) but costs ~3 min inside a server session that is already
+# up, keeps this row field-for-field identical to the other pp8 rows, and is what
+# the older report's positionwise figures consume.
 stage1() {
     echo "=== STAGE1_PP8_FP8 === $(date -u +%FT%TZ)"
     export PPQ_RESULTS_DIR="$PPQ9/results"
@@ -135,11 +162,13 @@ stage2() {
 }
 
 # ---------------------------------------------------------------- stage 3
-# Completes round 2 of the independent replication at 3 boundaries. Round 2
-# covered bf16/int4/mxfp4/nvfp4 - i.e. every format whose result was dramatic,
-# and none of the three whose result was "no effect". A null result that has
-# never been reproduced is exactly the kind that quietly turns out to be a
-# harness artifact, so these are the replicates that matter most.
+# OPT-IN, not part of the default `html` target: the newest report has no
+# replication section, so these fill nothing in it. They complete the replication
+# table in the older reports/pp_wire_quant_report.html, whose round 2 covered
+# bf16/int4/mxfp4/nvfp4 - every format whose result was dramatic, and none of the
+# three whose result was "no effect". An unreproduced null is the kind that
+# quietly turns out to be a harness artifact, so the science is worth doing; it
+# is simply not what "fill the HTML" asks for.
 # pp4/tp1 leaves 4 of the 8 GPUs idle; running two configs side by side would
 # need per-config ports and device masks in run_config.sh, which is not worth
 # the risk of mislabeling. Quality only, no bench.
@@ -158,8 +187,9 @@ case "$STAGE" in
     stage1) stage1 ;;
     stage2) stage2 ;;
     stage3) stage3 ;;
+    html)   stage0; stage1; stage2 ;;
     all)    stage0; stage1; stage2; stage3 ;;
-    *)      echo "usage: run_gapfill.sh [stage0|stage1|stage2|stage3|all]"; exit 2 ;;
+    *)      echo "usage: run_gapfill.sh [html|stage0|stage1|stage2|stage3|all]"; exit 2 ;;
 esac
 
 stop_server
@@ -177,10 +207,12 @@ from pathlib import Path
 root = Path(sys.argv[1])
 want = [("results/ctl_pp8_bf16", "wikitext.json"), ("results/pp8_fp8", "wikitext.json"),
         ("results_longprobe/lp2_pp8_fp8", "probe.json"),
-        ("results_longprobe/lp2_pp8_mxfp8", "probe.json"),
-        ("results_replicates/rep2_pp4_int8", "wikitext.json"),
-        ("results_replicates/rep2_pp4_fp8", "wikitext.json"),
-        ("results_replicates/rep2_pp4_mxfp8", "wikitext.json")]
+        ("results_longprobe/lp2_pp8_mxfp8", "probe.json")]
+# Only expected when stage 3 was asked for; absent is normal under the html target.
+optional = [("results_replicates/rep2_pp4_int8", "wikitext.json"),
+            ("results_replicates/rep2_pp4_fp8", "wikitext.json"),
+            ("results_replicates/rep2_pp4_mxfp8", "wikitext.json")]
+want += [o for o in optional if (root / o[0]).is_dir()]
 for rel, key in want:
     p = root / rel / key
     if not p.exists():
