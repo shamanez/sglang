@@ -492,9 +492,9 @@
 
           <article class="family-card eight-bit">
             <h3>8-bit methods tested</h3>
-            <p>All three are close to BF16 quality. The experiment does not establish one universal 8-bit winner.</p>
+            <p>All three are close to BF16 quality on the 35B model. On the 122B model the two floating point formats stay at the control while the integer format does not.</p>
             <div class="method-list">
-              <div class="method-row"><strong>INT8</strong><span>Integer values with one FP32 scale per token. It has the most mature fused implementation.</span></div>
+              <div class="method-row"><strong>INT8</strong><span>Integer values with one FP32 scale per token. It has the most mature fused implementation, but it is the only 8-bit format that loses measurable quality on the 122B model.</span></div>
               <div class="method-row"><strong>FP8</strong><span>E4M3 floating-point values with one FP32 scale per token. It was tested at one, three, and seven boundaries.</span></div>
               <div class="method-row"><strong>MXFP8</strong><span>E4M3 values with one E8M0 scale per 32 values. It has slightly more metadata.</span></div>
             </div>
@@ -557,7 +557,7 @@
                 <td>One FP32 scale per token</td>
                 <td class="num">4,104</td>
                 <td class="num">2.00×</td>
-                <td class="status-good">Best ready baseline</td>
+                <td class="status-caution">Costs +1.17% NLL on the 122B</td>
               </tr>
               <tr>
                 <td>Per-token float</td>
@@ -641,15 +641,15 @@
           </article>
           <article class="finding-card good">
             <h3>NVFP4 is more robust than MXFP4</h3>
-            <p>NLL favors NVFP4 at every shared topology. The clearest separation is the 122B model at seven boundaries, where NVFP4 records +1.86% NLL and 98% GSM8K while MXFP4 records +6.65% and 89%.</p>
+            <p>NLL favors NVFP4 at every shared topology. The clearest separation is the 122B model at seven boundaries, where NVFP4 records +1.86% NLL and 98% GSM8K while MXFP4 records +6.65% and 89%. That MXFP4 result was re-run on separate hardware and reproduced exactly, to every digit of NLL and to all one hundred GSM8K predictions, so it reflects the format rather than one unlucky run.</p>
           </article>
           <article class="finding-card caution">
             <h3>MXFP4 is still viable on 35B</h3>
-            <p>MXFP4 stays within +1.66% NLL through seven boundaries on the 35B model. Its 32-value blocks lose margin sooner than the 16-value NVFP4 blocks on the larger checkpoint.</p>
+            <p>MXFP4 stays within +1.66% NLL through seven boundaries on the 35B model. The separation from NVFP4 comes mostly from the scale format rather than the block count. Replacing MXFP4's power-of-two E8M0 scale with NVFP4's E4M3 scale accounts for 76 to 90 percent of the measured gap, while halving the block from 32 to 16 values accounts for 1 to 23 percent.</p>
           </article>
           <article class="finding-card good">
-            <h3>There is no proven 8-bit winner</h3>
-            <p>MXFP8 has the lowest seven-boundary NLL penalty at 0.08%, compared with 0.29% for INT8. The leader changes at shallower depths, FP8 lands at +0.08% once measured at seven boundaries, and every 8-bit format lands within a few GSM8K questions of the others. INT8 remains the practical reference because it provides a full twofold wire reduction at every tested depth.</p>
+            <h3>The 8-bit split appears only at scale</h3>
+            <p>On the 35B model the three 8-bit formats are equivalent, spanning +0.08% to +0.29% NLL at seven boundaries. On the 122B model they separate: FP8 and MXFP8 hold at the control, -0.02% and -0.00%, while INT8 costs +1.17%. FP8 and INT8 send the same 4,104 bytes per token under the same per-token scale, so element format is the only variable between them. A floating point exponent absorbs the activation outliers that a uniform integer grid cannot, and that matters more as the hidden size grows. Prefer FP8 or MXFP8 over INT8 for an 8-bit wire, and note that INT8 at 2.00x compression is barely ahead of NVFP4 at 3.54x.</p>
           </article>
         </div>
 
@@ -685,7 +685,7 @@
 
         <div class="subsection">
           <h3>The larger model narrows the margin</h3>
-          <p>At seven boundaries, the NLL penalty is roughly four times larger on 122B-FP8 than on 35B for every shared usable format. INT8 grows from +0.29% to +1.17%, NVFP4 from +0.43% to +1.86%, and MXFP4 from +1.66% to +6.65%. The larger hidden size creates a 1.5 times larger activation payload, but model size and FP8 weight precision are confounded. This is a sensitivity result, not a pure scaling law.</p>
+          <p>At seven boundaries, the NLL penalty is roughly four times larger on 122B-FP8 than on 35B for every shared usable format. INT8 grows from +0.29% to +1.17%, NVFP4 from +0.43% to +1.86%, and MXFP4 from +1.66% to +6.65%. The larger hidden size creates a 1.5 times larger activation payload, but model size and FP8 weight precision are confounded. This is a sensitivity result, not a pure scaling law. Width alone does not explain the MXFP4 gap: running the wire codecs directly on synthetic activations, the MXFP4 to NVFP4 error ratio is flat between hidden 2048 and 3072, and instead rises steeply with activation outlier severity, which points at the larger checkpoint's residual stream rather than its width.</p>
 
           <figure class="figure" aria-labelledby="large-title">
             <div class="figure-head">
@@ -700,8 +700,10 @@
               <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--green)">●</span>INT8</span>
               <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--amber)">◆</span>MXFP4</span>
               <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--magenta)">⬟</span>NVFP4</span>
+              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--blue)">■</span>FP8</span>
+              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--purple)">▲</span>MXFP8</span>
             </div>
-            <figcaption class="sr-only">At three and seven boundaries, INT8 increases NLL by 0.59% and 1.17%. MXFP4 increases it by 2.56% and 6.65%. NVFP4 increases it by 0.75% and 1.86%.</figcaption>
+            <figcaption class="sr-only">At three and seven boundaries, INT8 increases NLL by 0.59% and 1.17%. MXFP4 increases it by 2.56% and 6.65%. NVFP4 increases it by 0.75% and 1.86%. FP8 changes it by -0.15% and -0.02%, and MXFP8 by -0.01% and -0.00%, both at the control level.</figcaption>
           </figure>
 
           <div class="callout danger">
@@ -762,8 +764,10 @@
               <span class="legend-item"><span class="swatch-block" style="--swatch: var(--green)"></span>INT8</span>
               <span class="legend-item"><span class="swatch-block" style="--swatch: var(--amber)"></span>MXFP4</span>
               <span class="legend-item"><span class="swatch-block" style="--swatch: var(--magenta)"></span>NVFP4</span>
+              <span class="legend-item"><span class="swatch-block" style="--swatch: var(--blue)"></span>FP8</span>
+              <span class="legend-item"><span class="swatch-block" style="--swatch: var(--purple)"></span>MXFP8</span>
             </div>
-            <figcaption class="sr-only">Grouped bars on a 0 to 100% scale. At three and seven boundaries, BF16 scores 96% and 97%, INT8 scores 96% and 96%, MXFP4 scores 97% and 89%, and NVFP4 scores 96% and 98%.</figcaption>
+            <figcaption class="sr-only">Grouped bars on a 0 to 100% scale. At three and seven boundaries, BF16 scores 96% and 97%, INT8 scores 96% and 96%, MXFP4 scores 97% and 89%, NVFP4 scores 96% and 98%, FP8 scores 97% and 97%, and MXFP8 scores 95% and 98%.</figcaption>
           </figure>
         </div>
       </section>
@@ -848,8 +852,9 @@
               <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--purple)">▲</span>MXFP8</span>
               <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--amber)">◆</span>MXFP4</span>
               <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--magenta)">⬟</span>NVFP4</span>
+              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--blue)">■</span>FP8 (1 and 3 boundaries)</span>
             </div>
-            <figcaption class="sr-only">INT8 reduces median TTFT by about 23%, 21%, and 6% at one, three, and seven boundaries. The other formats show the same pattern of diminishing benefit with depth.</figcaption>
+            <figcaption class="sr-only">INT8 reduces median TTFT by about 23%, 21%, and 6% at one, three, and seven boundaries. The other formats show the same pattern of diminishing benefit with depth. FP8 appears at one and three boundaries only, at -1.0% and -20.8%; its seven-boundary run was made on a different host and is reported in the note below rather than plotted here.</figcaption>
           </figure>
 
           <div class="table-wrap" style="margin-top: 22px">
@@ -1202,14 +1207,16 @@
         yTitle: "NLL change (%)",
         xFormat: value => String(value),
         xTooltip: value => `${value} boundaries`,
-        yDomain: [0, 7],
+        yDomain: [-0.35, 7],
         yTicks: [0, 1, 2, 3, 4, 5, 6, 7],
         yFormat: value => `${value}%`,
         tooltipFormat: value => `${formatNumber(value, 2)}% NLL increase`,
         series: [
           { key: "int8", label: "INT8", values: [{ x: 3, y: 0.5890 }, { x: 7, y: 1.1699 }] },
           { key: "mxfp4", label: "MXFP4", values: [{ x: 3, y: 2.5575 }, { x: 7, y: 6.6538 }] },
-          { key: "nvfp4", label: "NVFP4", values: [{ x: 3, y: 0.7477 }, { x: 7, y: 1.8571 }] }
+          { key: "nvfp4", label: "NVFP4", values: [{ x: 3, y: 0.7477 }, { x: 7, y: 1.8571 }] },
+          { key: "fp8", label: "FP8", values: [{ x: 3, y: -0.1471 }, { x: 7, y: -0.024 }] },
+          { key: "mxfp8", label: "MXFP8", values: [{ x: 3, y: -0.007 }, { x: 7, y: -0.0042 }] }
         ]
       };
 
@@ -1268,7 +1275,9 @@
           { key: "bf16", label: "BF16", values: [{ x: 3, y: 96 }, { x: 7, y: 97 }] },
           { key: "int8", label: "INT8", values: [{ x: 3, y: 96 }, { x: 7, y: 96 }] },
           { key: "mxfp4", label: "MXFP4", values: [{ x: 3, y: 97 }, { x: 7, y: 89 }] },
-          { key: "nvfp4", label: "NVFP4", values: [{ x: 3, y: 96 }, { x: 7, y: 98 }] }
+          { key: "nvfp4", label: "NVFP4", values: [{ x: 3, y: 96 }, { x: 7, y: 98 }] },
+          { key: "fp8", label: "FP8", values: [{ x: 3, y: 97 }, { x: 7, y: 97 }] },
+          { key: "mxfp8", label: "MXFP8", values: [{ x: 3, y: 95 }, { x: 7, y: 98 }] }
         ]
       };
 
