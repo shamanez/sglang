@@ -308,6 +308,18 @@
     .finding-card.caution { border-top: 4px solid var(--amber); }
     .finding-card.bad { border-top: 4px solid var(--red); }
 
+    .tldr {
+      margin: 26px 0 0;
+      padding: 20px 22px;
+      border-left: 4px solid var(--green);
+      border-radius: 0 12px 12px 0;
+      background: var(--wash);
+    }
+    .tldr h2 { font-size: 19px; margin: 0 0 12px; letter-spacing: 0.01em; }
+    .tldr ol { margin: 0; padding-left: 21px; }
+    .tldr li { margin: 0 0 10px; color: var(--muted); font-size: 15px; line-height: 1.6; }
+    .tldr li:last-child { margin-bottom: 0; }
+    .tldr li strong { color: var(--ink); font-weight: 700; }
     .callout {
       margin-top: 18px;
       padding: 17px 19px;
@@ -402,8 +414,36 @@
           <p class="eyebrow">Pipeline-parallel communication</p>
           <h1 id="report-title">Compressing activations on the pipeline wire</h1>
           <p class="hero-lead">We measured how BF16, 8-bit, and 4-bit wire formats reduce transferred bytes while preserving model quality as pipeline depth, model size, and decode horizon increase.</p>
-          <p class="hero-meta">Qwen3.6-35B-A3B and Qwen3.5-122B-A10B-FP8 on 4 × and 8 × RTX 5090 systems. SGLang development branch at <code>c1ff73797</code>.</p>
+          <p class="hero-meta">Qwen3.6-35B-A3B and Qwen3.5-122B-A10B-FP8 on 4 × and 8 × RTX 5090 systems.</p>
         </div>
+      </section>
+
+      <section class="tldr" aria-label="Summary">
+        <h2>TLDR</h2>
+        <ol>
+          <li><strong>Only the pipeline boundary traffic is quantized.</strong> The <code>hidden_states</code> and
+            <code>residual</code> tensors are compressed for each stage to stage send and reconstructed on arrival.
+            Weights, KV cache and all compute stay untouched. Measured at 1, 3 and 7 boundaries on two mixture of
+            experts models, a 35B with BF16 weights and a 122B with FP8 weights.</li>
+          <li><strong>8-bit is free, but which 8-bit matters once the model is large.</strong> On the 35B every
+            8-bit format costs at most +0.29% NLL and leaves GSM8K accuracy unchanged. On the 122B they separate:
+            FP8 and MXFP8 sit at the control while INT8 costs +1.17% NLL for the same 4,104 bytes per token under
+            the same per-token scale. A floating point element absorbs activation outliers that a uniform integer
+            grid cannot, so element format decides this, not bit width.</li>
+          <li><strong>At 4-bit the scale granularity decides.</strong> Per-token INT4 collapses to +495% NLL and
+            0% GSM8K accuracy at seven boundaries. Microscaled NVFP4 holds at +1.86% NLL and 98% GSM8K while
+            compressing 3.54 times. MXFP4 lands between them at +6.65% and 89%, and the distance to NVFP4 comes
+            mostly from its power of two E8M0 scale rather than from its larger block.</li>
+          <li><strong>Error accumulates with boundary count, never with decode position.</strong> The NLL penalty
+            grows from 1 to 3 to 7 boundaries for every lossy format, while top-1 agreement against a frozen
+            trajectory stays flat across 1,024 decode steps for every usable format, including INT4 at its own
+            degraded level.</li>
+          <li><strong>NLL and GSM8K accuracy answer different questions.</strong> NLL is teacher forced over
+            24,576 tokens and resolves shifts far below what a 100 question benchmark can see. Across all 30
+            measured cells GSM8K moved significantly only where NLL exceeded about 11%, so NLL is the early
+            warning instrument and GSM8K accuracy is the survival check. Differences of a point or two in
+            accuracy are inside the sampling interval and should not be read as a ranking.</li>
+        </ol>
       </section>
 
       <section class="summary-grid" aria-label="Headline results">
@@ -901,7 +941,7 @@
     </main>
 
     <footer>
-      <p>This report has no external runtime dependencies. Results were collected on 21 to 23 August 2026 from archived SGLang experiment outputs.</p>
+      <p>This report has no external runtime dependencies. Results were collected on 21 to 24 August 2026 from archived SGLang experiment outputs.</p>
     </footer>
   </div>
 
