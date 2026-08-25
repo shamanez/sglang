@@ -1,0 +1,1 @@
+{"pp_size": 2, "tp_size": 2, "attention_backend": "flashinfer", "version": "0.0.0.dev16907+g528bfac70", "SGLANG_PP_ACTIVATION_WIRE_QUANT": "nvfp4"}

@@ -59,6 +59,280 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+_PP_WIRE_SCALE_SUFFIX = "__wire_scale"
+_PP_WIRE_CODEC_KEY = "__wire_codec__"
+_PP_WIRE_MODES = ("int8", "fp8", "int4", "mxfp8", "mxfp4", "nvfp4")
+# Hidden-size divisibility each mode's packing/blocking requires.
+_PP_WIRE_MODE_DIVISOR = {"int4": 2, "mxfp8": 32, "mxfp4": 32, "nvfp4": 16}
+# OCP e2m1 representable magnitudes; codes are sign<<3 | magnitude index.
+_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+_E4M3_MAX = 448.0
+# Per-device e2m1 constants; building them per call would enqueue an H2D copy
+# that blocks the scheduler until the stream drains, on every proxy send/recv.
+_E2M1_CONST_CACHE: Dict[torch.device, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _pp_e2m1_consts(device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    consts = _E2M1_CONST_CACHE.get(device)
+    if consts is None:
+        consts = (
+            torch.tensor(_E2M1_MIDPOINTS, device=device, dtype=torch.float32),
+            torch.tensor(_E2M1_GRID, device=device, dtype=torch.float32),
+        )
+        _E2M1_CONST_CACHE[device] = consts
+    return consts
+
+
+def resolve_pp_wire_quant_mode() -> Optional[str]:
+    # Called from init_pp_loop_state so a bad value or unsupported platform
+    # fails at startup on every PP rank, not on the first proxy send.
+    mode = envs.SGLANG_PP_ACTIVATION_WIRE_QUANT.get()
+    if not mode:
+        return None
+    mode = mode.strip().lower()
+    if mode not in _PP_WIRE_MODES:
+        raise ValueError(
+            f"SGLANG_PP_ACTIVATION_WIRE_QUANT must be one of {_PP_WIRE_MODES}, "
+            f"got {mode!r}"
+        )
+    if mode == "fp8":
+        from sglang.kernels.ops.quantization import fp8_kernel
+
+        # The sgl per-token fp8 kernel is only bound on CUDA/MUSA builds.
+        if not hasattr(fp8_kernel, "sgl_per_token_quant_fp8"):
+            raise ValueError(
+                "SGLANG_PP_ACTIVATION_WIRE_QUANT=fp8 requires the CUDA/MUSA "
+                "sgl per-token fp8 kernel; use int8 or int4 on this platform"
+            )
+    return mode
+
+
+def _pp_pack_int4_per_token(x: torch.Tensor):
+    absmax = x.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-10)
+    scale = absmax / 7.0
+    q = torch.round(x.float() / scale).clamp_(-8, 7).to(torch.int16)
+    packed = ((q[:, 0::2] & 0xF) | ((q[:, 1::2] & 0xF) << 4)).to(torch.uint8)
+    return packed, scale
+
+
+def _pp_pack_nibbles(codes: torch.Tensor) -> torch.Tensor:
+    return codes[:, 0::2] | (codes[:, 1::2] << 4)
+
+
+def _pp_unpack_nibbles(packed: torch.Tensor) -> torch.Tensor:
+    return torch.stack((packed & 0xF, (packed >> 4) & 0xF), dim=-1).view(
+        packed.shape[0], -1
+    )
+
+
+def _pp_e8m0_block_scale(x: torch.Tensor, block: int, fmt_max: float):
+    # E8M0 scales are pure powers of two, stored as the biased exponent byte;
+    # ceil keeps every value in the block within fmt_max after scaling. The
+    # upper clamp keeps fmt_max * 2^exp finite in fp32: values past it (bf16
+    # divergence territory) clip instead of decoding to inf.
+    blocks = x.float().reshape(x.shape[0], -1, block)
+    absmax = blocks.abs().amax(dim=-1).clamp_min(1e-30)
+    exp_max = 127 - math.ceil(math.log2(fmt_max))
+    exp = torch.ceil(torch.log2(absmax / fmt_max)).clamp_(-127, exp_max)
+    return blocks, torch.exp2(exp), (exp + 127).to(torch.uint8)
+
+
+def _pp_e2m1_encode(y: torch.Tensor) -> torch.Tensor:
+    bounds, _ = _pp_e2m1_consts(y.device)
+    idx = torch.bucketize(y.abs(), bounds, out_int32=True).to(torch.uint8)
+    return idx | ((y < 0).to(torch.uint8) << 3)
+
+
+def _pp_e2m1_decode(codes: torch.Tensor) -> torch.Tensor:
+    _, grid = _pp_e2m1_consts(codes.device)
+    mag = grid[(codes & 0x7).long()]
+    return torch.where((codes & 0x8).bool(), -mag, mag)
+
+
+def _pp_pack_mxfp8_per_block(x: torch.Tensor):
+    blocks, scale, scale_bytes = _pp_e8m0_block_scale(x, 32, _E4M3_MAX)
+    q = (blocks / scale.unsqueeze(-1)).clamp_(-_E4M3_MAX, _E4M3_MAX)
+    q = q.reshape(x.shape[0], -1).to(torch.float8_e4m3fn).view(torch.uint8)
+    return q, scale_bytes
+
+
+def _pp_clamp_to_dtype(x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    # Rounding up inside the quant grid can push the decoded product past
+    # out_dtype's max (e.g. fp16 outlier channels); clamp instead of inf.
+    lim = torch.finfo(out_dtype).max
+    return x.clamp_(-lim, lim).to(out_dtype)
+
+
+def _pp_unpack_mxfp8_per_block(
+    packed: torch.Tensor, scale_bytes: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    scale = torch.exp2(scale_bytes.float() - 127.0)
+    vals = packed.view(torch.float8_e4m3fn).float().reshape(packed.shape[0], -1, 32)
+    vals = (vals * scale.unsqueeze(-1)).reshape(packed.shape[0], -1)
+    return _pp_clamp_to_dtype(vals, out_dtype)
+
+
+def _pp_pack_mxfp4_per_block(x: torch.Tensor):
+    blocks, scale, scale_bytes = _pp_e8m0_block_scale(x, 32, _E2M1_GRID[-1])
+    codes = _pp_e2m1_encode(blocks / scale.unsqueeze(-1)).reshape(x.shape[0], -1)
+    return _pp_pack_nibbles(codes), scale_bytes
+
+
+def _pp_unpack_mxfp4_per_block(
+    packed: torch.Tensor, scale_bytes: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    scale = torch.exp2(scale_bytes.float() - 127.0)
+    vals = _pp_e2m1_decode(_pp_unpack_nibbles(packed))
+    vals = vals.reshape(packed.shape[0], -1, 32) * scale.unsqueeze(-1)
+    return _pp_clamp_to_dtype(vals.reshape(packed.shape[0], -1), out_dtype)
+
+
+def _pp_pack_nvfp4_per_block(x: torch.Tensor):
+    # NVFP4 recipe: per-token fp32 global scale + per-16-block e4m3 scale.
+    # Quantization must use the e4m3-decoded scale so both ends agree.
+    blocks = x.float().reshape(x.shape[0], -1, 16)
+    block_absmax = blocks.abs().amax(dim=-1)
+    global_scale = (
+        block_absmax.amax(dim=-1, keepdim=True) / (_E4M3_MAX * _E2M1_GRID[-1])
+    ).clamp_min(1e-30)
+    bs_e4m3 = (block_absmax / (_E2M1_GRID[-1] * global_scale)).clamp_(
+        0, _E4M3_MAX
+    ).to(torch.float8_e4m3fn)
+    eff_scale = (bs_e4m3.float() * global_scale).clamp_min(1e-30)
+    codes = _pp_e2m1_encode(blocks / eff_scale.unsqueeze(-1)).reshape(x.shape[0], -1)
+    # Sidecar wire layout: [T, H/16] e4m3 block scales as bytes, then the
+    # per-token fp32 global scale as 4 bytes; the receiver splits by column.
+    sidecar = torch.cat(
+        (bs_e4m3.view(torch.uint8), global_scale.view(torch.uint8)), dim=1
+    )
+    return _pp_pack_nibbles(codes), sidecar
+
+
+def _pp_unpack_nvfp4_per_block(
+    packed: torch.Tensor, sidecar: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    bs = sidecar[:, :-4].contiguous().view(torch.float8_e4m3fn).float()
+    # Copy into a fresh buffer: contiguous()/clone() on a [1, 4] slice keep the
+    # parent's storage offset/stride, which view(float32) rejects unless the
+    # sidecar width happens to be 4-byte aligned.
+    gs_bytes = sidecar.new_empty((sidecar.shape[0], 4))
+    gs_bytes.copy_(sidecar[:, -4:])
+    global_scale = gs_bytes.view(torch.float32)
+    eff_scale = (bs * global_scale).clamp_min(1e-30)
+    vals = _pp_e2m1_decode(_pp_unpack_nibbles(packed))
+    vals = vals.reshape(packed.shape[0], -1, 16) * eff_scale.unsqueeze(-1)
+    return _pp_clamp_to_dtype(vals.reshape(packed.shape[0], -1), out_dtype)
+
+
+def _pp_unpack_int4_per_token(
+    packed: torch.Tensor, scale: torch.Tensor, out_dtype: torch.dtype
+) -> torch.Tensor:
+    p = packed.to(torch.int16)
+    nibbles = torch.stack((p & 0xF, (p >> 4) & 0xF), dim=-1).view(p.shape[0], -1)
+    q = torch.where(nibbles > 7, nibbles - 16, nibbles)
+    return (q.float() * scale).to(out_dtype)
+
+
+def _pp_quantize_wire_dict(
+    tensor_dict: Dict[str, torch.Tensor], mode: str
+) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in tensor_dict.items():
+        if isinstance(value, torch.Tensor) and (
+            key == _PP_WIRE_CODEC_KEY or key.endswith(_PP_WIRE_SCALE_SUFFIX)
+        ):
+            raise ValueError(
+                f"PP proxy key {key!r} collides with the wire-codec protocol"
+            )
+        eligible = (
+            isinstance(value, torch.Tensor)
+            and value.is_floating_point()
+            and value.dim() == 2
+            # The fp8 kernel asserts num_tokens > 0; idle PP+DP-attention
+            # microbatches legitimately send [0, H] proxies.
+            and value.shape[0] > 0
+            and value.shape[1] % _PP_WIRE_MODE_DIVISOR.get(mode, 1) == 0
+        )
+        if not eligible:
+            if (
+                isinstance(value, torch.Tensor)
+                and value.is_floating_point()
+                and value.numel() > 0
+            ):
+                logger.warning_once(
+                    f"PP wire quant ({mode}): key {key!r} shape "
+                    f"{tuple(value.shape)} is not eligible; sent at full "
+                    "precision (mixed-precision wire)"
+                )
+            out[key] = value
+            continue
+        # Out of place: `value` aliases tensors the current forward still
+        # reads, and under CUDA graphs it is a slice of a reused static buffer.
+        x = value.contiguous()
+        if mode == "int8":
+            from sglang.kernels.ops.quantization.int8_kernel import (
+                per_token_quant_int8,
+            )
+
+            q, s = per_token_quant_int8(x)
+        elif mode == "fp8":
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_quant_fp8,
+            )
+
+            q, s = sglang_per_token_quant_fp8(x)
+            # NCCL has no fp8 dtype: ship the bytes, re-view on the far side.
+            q = q.view(torch.uint8)
+        elif mode == "mxfp8":
+            q, s = _pp_pack_mxfp8_per_block(x)
+        elif mode == "mxfp4":
+            q, s = _pp_pack_mxfp4_per_block(x)
+        elif mode == "nvfp4":
+            q, s = _pp_pack_nvfp4_per_block(x)
+        else:
+            q, s = _pp_pack_int4_per_token(x)
+        out[key] = q
+        out[key + _PP_WIRE_SCALE_SUFFIX] = s
+    out[_PP_WIRE_CODEC_KEY] = mode
+    return out
+
+
+def _pp_dequantize_wire_dict(
+    tensor_dict: Dict[str, torch.Tensor], out_dtype: torch.dtype
+) -> Dict[str, torch.Tensor]:
+    # Triggered only by the reserved codec tag, so an unquantized dict (the
+    # flag-off path, and any model's own key names) passes through untouched.
+    mode = tensor_dict.get(_PP_WIRE_CODEC_KEY)
+    if mode is None:
+        return tensor_dict
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in tensor_dict.items():
+        if key == _PP_WIRE_CODEC_KEY or key.endswith(_PP_WIRE_SCALE_SUFFIX):
+            continue
+        scale = tensor_dict.get(key + _PP_WIRE_SCALE_SUFFIX)
+        if scale is None:
+            out[key] = value
+        elif mode == "int4":
+            out[key] = _pp_unpack_int4_per_token(value, scale, out_dtype)
+        elif mode == "mxfp8":
+            out[key] = _pp_unpack_mxfp8_per_block(value, scale, out_dtype)
+        elif mode == "mxfp4":
+            out[key] = _pp_unpack_mxfp4_per_block(value, scale, out_dtype)
+        elif mode == "nvfp4":
+            out[key] = _pp_unpack_nvfp4_per_block(value, scale, out_dtype)
+        elif mode == "fp8":
+            from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+            # fp8_dtype is e4m3fnuz on fnuz platforms; the view must match
+            # what the sender's kernel emitted.
+            out[key] = (value.view(fp8_dtype).to(torch.float32) * scale).to(out_dtype)
+        else:
+            # int8 * f32 promotes to f32 inside one fused elementwise kernel.
+            out[key] = (value * scale).to(out_dtype)
+    return out
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -559,6 +833,11 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
+        self.pp_wire_quant_mode: Optional[str] = resolve_pp_wire_quant_mode()
+        if self.pp_wire_quant_mode is not None:
+            logger.info(
+                f"PP activation wire quantization enabled: {self.pp_wire_quant_mode}"
+            )
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
@@ -1040,7 +1319,12 @@ class SchedulerPPMixin:
                 "PP send: using default untyped message. "
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
-        tensor_dict["__msg_type__"] = msg_type
+        if msg_type == "proxy" and self.pp_wire_quant_mode is not None:
+            tensor_dict = _pp_quantize_wire_dict(
+                tensor_dict, mode=self.pp_wire_quant_mode
+            )
+        # Uniformly non-mutating: the caller still owns the original dict.
+        tensor_dict = {**tensor_dict, "__msg_type__": msg_type}
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1089,12 +1373,15 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
+            tensor_dict = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
+            )
             pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
+                _pp_dequantize_wire_dict(
+                    tensor_dict, out_dtype=self.model_config.dtype
                 )
             )
         return pp_proxy_tensors

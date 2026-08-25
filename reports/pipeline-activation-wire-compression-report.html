@@ -1,0 +1,1343 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pipeline Activation Wire Compression</title>
+  <meta name="description" content="A concise report on BF16, 8-bit, and microscaled 4-bit activation compression across pipeline boundaries in SGLang.">
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172126;
+      --muted: #59686e;
+      --faint: #7b888d;
+      --line: #d8e1df;
+      --paper: #ffffff;
+      --bg: #f4f7f5;
+      --wash: #eaf2ee;
+      --wash-blue: #e9f0f7;
+      --green: #116b58;
+      --blue: #245f96;
+      --purple: #6c4da0;
+      --red: #b13a32;
+      --amber: #96720c;
+      --magenta: #a13f77;
+      --gray-series: #6c777b;
+      --green-soft: #e2f1eb;
+      --red-soft: #f8e9e6;
+      --amber-soft: #f6efd9;
+      --shadow: 0 20px 54px rgba(23, 33, 38, 0.14);
+      --card-shadow: 0 10px 28px rgba(23, 33, 38, 0.08);
+      --maxw: 1120px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --ink: #e8efec;
+        --muted: #a8b5b8;
+        --faint: #87959a;
+        --line: #29373c;
+        --paper: #121b1f;
+        --bg: #0b1215;
+        --wash: #14231f;
+        --wash-blue: #152635;
+        --green: #65cbb0;
+        --blue: #8db9e3;
+        --purple: #baa4e3;
+        --red: #ff9086;
+        --amber: #e5c96f;
+        --magenta: #ec9ac7;
+        --gray-series: #a8b5b8;
+        --green-soft: #173129;
+        --red-soft: #341f20;
+        --amber-soft: #302a19;
+        --shadow: 0 20px 54px rgba(0, 0, 0, 0.5);
+        --card-shadow: 0 10px 28px rgba(0, 0, 0, 0.34);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: linear-gradient(180deg, var(--paper) 0, var(--bg) 620px, var(--bg) 100%);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.58;
+      overflow-wrap: break-word;
+    }
+
+    a { color: var(--blue); }
+    p { margin: 0 0 1rem; }
+    strong { font-weight: 760; }
+    .shell { width: min(var(--maxw), calc(100% - 32px)); margin: 0 auto; }
+
+    .topbar {
+      min-height: 68px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .brand { color: var(--ink); font-weight: 800; }
+    .topbar-meta { text-align: right; }
+
+    .hero {
+      position: relative;
+      min-height: 440px;
+      display: flex;
+      align-items: end;
+      overflow: hidden;
+      border-radius: 16px;
+      background:
+        radial-gradient(90% 140% at 90% -20%, rgba(77, 145, 173, 0.72) 0%, rgba(12, 33, 31, 0) 57%),
+        linear-gradient(125deg, #0b1d1b 0%, #103b32 53%, #17364b 100%);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: 0 0 0 auto;
+      width: 46%;
+      opacity: 0.7;
+      background:
+        linear-gradient(90deg, transparent 0 15%, rgba(255, 255, 255, 0.08) 15% 15.5%, transparent 15.5% 38%, rgba(255, 255, 255, 0.08) 38% 38.5%, transparent 38.5% 62%, rgba(255, 255, 255, 0.08) 62% 62.5%, transparent 62.5%),
+        radial-gradient(circle at 15% 50%, #aee2d5 0 5px, transparent 6px),
+        radial-gradient(circle at 38% 50%, #aee2d5 0 5px, transparent 6px),
+        radial-gradient(circle at 62% 50%, #aee2d5 0 5px, transparent 6px),
+        radial-gradient(circle at 86% 50%, #aee2d5 0 5px, transparent 6px);
+    }
+
+    .hero-copy {
+      position: relative;
+      z-index: 1;
+      width: min(790px, 100%);
+      padding: clamp(30px, 6vw, 64px);
+      color: #ffffff;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: #bce7d9;
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: 0.11em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 760px;
+      margin: 0;
+      font-size: clamp(38px, 6vw, 66px);
+      line-height: 1.01;
+      letter-spacing: -0.035em;
+      text-wrap: balance;
+    }
+
+    .hero-lead {
+      max-width: 64ch;
+      margin: 20px 0 0;
+      color: rgba(255, 255, 255, 0.84);
+      font-size: clamp(16px, 2vw, 19px);
+    }
+
+    .hero-meta {
+      margin: 18px 0 0;
+      color: rgba(255, 255, 255, 0.68);
+      font-size: 13px;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin: 20px 0 0;
+    }
+
+    .summary-card {
+      padding: 19px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--paper);
+      box-shadow: var(--card-shadow);
+    }
+
+    .summary-card .metric {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--green);
+      font-size: clamp(23px, 3vw, 32px);
+      font-weight: 820;
+      line-height: 1;
+    }
+
+    .summary-card p { margin: 0; color: var(--muted); font-size: 14px; }
+
+    .toc {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      margin: 30px 0 0;
+      padding: 14px 0;
+      border-block: 1px solid var(--line);
+      font-size: 14px;
+      font-weight: 750;
+    }
+
+    .toc a { color: var(--muted); text-decoration: none; }
+    .toc a:hover, .toc a:focus { color: var(--green); text-decoration: underline; }
+
+    main { padding-bottom: 28px; }
+    .report-section { padding-top: clamp(48px, 7vw, 76px); }
+    .section-kicker { margin: 0 0 6px; color: var(--green); font-size: 12px; font-weight: 850; letter-spacing: 0.1em; text-transform: uppercase; }
+
+    h2 {
+      margin: 0;
+      font-size: clamp(29px, 4vw, 43px);
+      line-height: 1.08;
+      letter-spacing: -0.025em;
+      text-wrap: balance;
+    }
+
+    h3 { margin: 0; font-size: clamp(21px, 2.5vw, 28px); line-height: 1.16; }
+    h4 { margin: 0; font-size: 18px; line-height: 1.2; }
+    .section-intro { max-width: 74ch; margin: 12px 0 0; color: var(--muted); }
+
+    .mechanism-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.18fr) minmax(280px, 0.82fr);
+      gap: 18px;
+      margin-top: 24px;
+    }
+
+    .mechanism, .note-card, .finding-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--paper);
+    }
+
+    .mechanism { padding: clamp(18px, 3vw, 28px); }
+    .mechanism-flow { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 12px; margin-top: 20px; }
+    .stage { min-height: 154px; padding: 17px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+    .stage-label { color: var(--green); font-size: 12px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+    .tensor { display: block; margin-top: 13px; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+    .wire { min-width: 132px; text-align: center; color: var(--muted); font-size: 12px; font-weight: 760; }
+    .wire-line { position: relative; height: 2px; margin: 12px 0; background: var(--green); }
+    .wire-line::after { content: ""; position: absolute; top: -4px; right: 0; border-width: 5px 0 5px 8px; border-style: solid; border-color: transparent transparent transparent var(--green); }
+    .wire-codec { display: block; color: var(--green); }
+
+    .note-card { padding: 22px; }
+    .note-card h3 { font-size: 20px; }
+    .note-card p { margin: 10px 0 0; color: var(--muted); font-size: 14px; }
+    .plain-list { margin: 14px 0 0; padding-left: 20px; }
+    .plain-list li { margin: 8px 0; }
+
+    .family-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 22px; }
+    .family-card { padding: 22px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); }
+    .family-card.four-bit { border-top: 4px solid var(--magenta); }
+    .family-card.eight-bit { border-top: 4px solid var(--green); }
+    .family-card > p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+    .method-list { display: grid; gap: 0; margin: 16px 0 0; }
+    .method-row { display: grid; grid-template-columns: 76px 1fr; gap: 12px; padding: 11px 0; border-top: 1px solid var(--line); }
+    .method-row strong { color: var(--ink); }
+    .method-row span { color: var(--muted); font-size: 13px; }
+    .family-verdict { margin-top: 14px !important; padding-top: 13px; border-top: 1px solid var(--line); color: var(--ink) !important; }
+
+    .table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    caption { padding: 0 0 10px; color: var(--muted); text-align: left; font-size: 13px; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    thead th { color: var(--muted); font-size: 11px; font-weight: 850; letter-spacing: 0.07em; text-transform: uppercase; }
+    tbody th { font-weight: 800; }
+    td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .group-row th { padding-top: 20px; color: var(--green); background: var(--bg); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .status-good { color: var(--green); font-weight: 780; }
+    .status-caution { color: var(--amber); font-weight: 780; }
+    .status-bad { color: var(--red); font-weight: 780; }
+    .muted { color: var(--muted); }
+
+    .figure {
+      margin: 26px 0 0;
+      padding: clamp(17px, 2.5vw, 24px);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--paper);
+    }
+
+    .figure-head { display: flex; align-items: start; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
+    .figure-head p { max-width: 66ch; margin: 7px 0 0; color: var(--muted); font-size: 14px; }
+    .chart-host { width: 100%; min-height: 260px; }
+    .chart-host svg { display: block; width: 100%; height: auto; overflow: visible; }
+    .chart-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 18px; }
+    .chart-panel { min-width: 0; padding-top: 4px; }
+    .chart-panel h4 { margin-bottom: 4px; }
+    .chart-panel > p { margin: 0 0 6px; color: var(--muted); font-size: 13px; }
+    .chart-panel .chart-host { min-height: 250px; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 7px 14px; margin: 10px 0 0; color: var(--muted); font-size: 12px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .swatch { width: 18px; height: 3px; border-radius: 999px; background: var(--swatch); }
+    .swatch-block { width: 13px; height: 11px; border-radius: 3px; background: var(--swatch); }
+    .marker-symbol { width: 13px; color: var(--marker-color); font-size: 12px; font-weight: 850; line-height: 1; text-align: center; }
+    .axis-text { fill: var(--muted); font-size: 11px; }
+    .axis-title { fill: var(--muted); font-size: 11px; font-weight: 720; }
+    .grid-line { stroke: var(--line); stroke-width: 1; }
+    .axis-line { stroke: var(--faint); stroke-width: 1; }
+    .series-line { fill: none; stroke-width: 2.4; stroke-linejoin: round; stroke-linecap: round; }
+    .series-point { stroke: var(--paper); stroke-width: 2; }
+    .bar-value { fill: var(--ink); font-size: 12px; font-weight: 750; }
+    .bar-value-sm { fill: var(--ink); font-size: 10px; font-weight: 750; }
+    .bar-label { fill: var(--ink); font-size: 12px; font-weight: 720; }
+
+    .flash-list { margin: 22px 0 0; padding: 0; border-top: 1px solid var(--line); list-style: none; }
+    .flash-item { display: grid; grid-template-columns: minmax(130px, 0.25fr) minmax(0, 1fr); gap: 20px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+    .flash-label { color: var(--green); font-size: 11px; font-weight: 850; letter-spacing: 0.08em; text-transform: uppercase; }
+    .flash-item p { margin: 0; color: var(--muted); }
+    .flash-item strong { color: var(--ink); }
+
+    .finding-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 22px; }
+    .finding-card { padding: 20px; }
+    .finding-card p { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+    .finding-card.good { border-top: 4px solid var(--green); }
+    .finding-card.caution { border-top: 4px solid var(--amber); }
+    .finding-card.bad { border-top: 4px solid var(--red); }
+
+    .tldr {
+      margin: 26px 0 0;
+      padding: 20px 22px;
+      border-left: 4px solid var(--green);
+      border-radius: 0 12px 12px 0;
+      background: var(--wash);
+    }
+    .tldr h2 { font-size: 19px; margin: 0 0 12px; letter-spacing: 0.01em; }
+    .tldr ol { margin: 0; padding-left: 21px; }
+    .tldr li { margin: 0 0 10px; color: var(--muted); font-size: 15px; line-height: 1.6; }
+    .tldr li:last-child { margin-bottom: 0; }
+    .tldr li strong { color: var(--ink); font-weight: 700; }
+    .callout {
+      margin-top: 18px;
+      padding: 17px 19px;
+      border-left: 4px solid var(--green);
+      border-radius: 0 10px 10px 0;
+      background: var(--wash);
+    }
+
+    .callout p { margin: 0; }
+    .callout.danger { border-left-color: var(--red); background: var(--red-soft); }
+    .callout.caution { border-left-color: var(--amber); background: var(--amber-soft); }
+
+    .subsection { margin-top: 48px; }
+    .subsection > p { max-width: 76ch; margin: 10px 0 0; color: var(--muted); }
+    .metric-note { margin: 10px 0 0; color: var(--muted); font-size: 13px; }
+    .pill { display: inline-flex; padding: 3px 8px; border-radius: 999px; background: var(--green-soft); color: var(--green); font-size: 11px; font-weight: 850; letter-spacing: 0.05em; text-transform: uppercase; }
+    .pill.direction-down { background: var(--wash-blue); color: var(--blue); }
+    .pill.direction-up { background: var(--green-soft); color: var(--green); }
+    .pill.direction-flat { background: var(--amber-soft); color: var(--amber); }
+
+    details { margin-top: 18px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+    summary { cursor: pointer; padding: 15px 18px; font-weight: 800; }
+    details > div { padding: 0 18px 18px; }
+    code { padding: 1px 5px; border-radius: 5px; background: var(--wash); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em; }
+    pre { margin: 12px 0 0; padding: 14px; overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); font-size: 12px; }
+
+    footer { padding: 38px 0 54px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+    @media (max-width: 860px) {
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .mechanism-grid, .family-grid { grid-template-columns: 1fr; }
+      /* Side-by-side panels shrink past the point where the bar labels are legible. */
+      .chart-pair { grid-template-columns: 1fr; gap: 26px; }
+      .hero::after { opacity: 0.35; width: 55%; }
+    }
+
+    @media (max-width: 800px) {
+      .chart-pair { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 700px) {
+      .finding-grid { grid-template-columns: 1fr; }
+      .flash-item { grid-template-columns: 1fr; gap: 4px; }
+      .mechanism-flow { grid-template-columns: 1fr; }
+      .wire { min-width: 0; padding: 6px 26px; }
+      .wire-line { transform: rotate(90deg); width: 48px; margin: 28px auto; }
+      .figure-head { display: block; }
+    }
+
+    @media (max-width: 520px) {
+      .shell { width: min(100% - 24px, var(--maxw)); }
+      .topbar { align-items: start; flex-direction: column; padding: 16px 0; }
+      .topbar-meta { text-align: left; }
+      .hero { min-height: 430px; border-radius: 12px; }
+      .hero-copy { padding: 28px 22px; }
+      .hero::after { display: none; }
+      .summary-grid { grid-template-columns: 1fr; }
+      .summary-card { box-shadow: none; }
+      th, td { padding: 9px 10px; }
+      .figure { padding: 15px 12px; }
+    }
+
+    @media print {
+      :root { color-scheme: light; }
+      body { background: #ffffff; }
+      .hero { min-height: 0; box-shadow: none; }
+      .toc { display: none; }
+      .report-section { break-inside: avoid; }
+      details > div { display: block; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">Efficient Inference</div>
+      <div class="topbar-meta">Compression study&nbsp;&nbsp;|&nbsp;&nbsp;August 2026</div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="report-title">
+        <div class="hero-copy">
+          <p class="eyebrow">Pipeline-parallel communication</p>
+          <h1 id="report-title">Compressing activations on the pipeline wire</h1>
+          <p class="hero-lead">We measured how BF16, 8-bit, and 4-bit wire formats reduce transferred bytes while preserving model quality as pipeline depth, model size, and decode horizon increase.</p>
+          <p class="hero-meta">Qwen3.6-35B-A3B and Qwen3.5-122B-A10B-FP8 on 4 × and 8 × RTX 5090 systems.</p>
+        </div>
+      </section>
+
+      <section class="tldr" aria-label="Summary">
+        <h2>TLDR</h2>
+        <ol>
+          <li><strong>Only the pipeline boundary traffic is quantized.</strong> The <code>hidden_states</code> and
+            <code>residual</code> tensors are compressed for each stage to stage send and reconstructed on arrival.
+            Weights, KV cache and all compute stay untouched. Measured at 1, 3 and 7 boundaries on two mixture of
+            experts models, a 35B with BF16 weights and a 122B with FP8 weights.</li>
+          <li><strong>8-bit is free, but which 8-bit matters once the model is large.</strong> On the 35B every
+            8-bit format costs at most +0.29% NLL and leaves GSM8K accuracy unchanged. On the 122B they separate:
+            FP8 and MXFP8 sit at the control while INT8 costs +1.17% NLL for the same 4,104 bytes per token under
+            the same per-token scale. A floating point element absorbs activation outliers that a uniform integer
+            grid cannot, so element format decides this, not bit width.</li>
+          <li><strong>At 4-bit the scale granularity decides.</strong> Per-token INT4 collapses to +495% NLL and
+            0% GSM8K accuracy at seven boundaries. Microscaled NVFP4 holds at +1.86% NLL and 98% GSM8K while
+            compressing 3.54 times. MXFP4 lands between them at +6.65% and 89%, and the distance to NVFP4 comes
+            mostly from its power of two E8M0 scale rather than from its larger block.</li>
+          <li><strong>Error accumulates with boundary count, never with decode position.</strong> The NLL penalty
+            grows from 1 to 3 to 7 boundaries for every lossy format, while top-1 agreement against a frozen
+            trajectory stays flat across 1,024 decode steps for every usable format, including INT4 at its own
+            degraded level.</li>
+          <li><strong>NLL and GSM8K accuracy answer different questions.</strong> NLL is teacher forced over
+            24,576 tokens and resolves shifts far below what a 100 question benchmark can see. Across all 30
+            measured cells GSM8K moved significantly only where NLL exceeded about 11%, so NLL is the early
+            warning instrument and GSM8K accuracy is the survival check. Differences of a point or two in
+            accuracy are inside the sampling interval and should not be read as a ranking.</li>
+        </ol>
+      </section>
+
+      <section class="summary-grid" aria-label="Headline results">
+        <article class="summary-card">
+          <span class="metric">2.00×</span>
+          <p>INT8 halves boundary traffic with no material quality loss in the tested range.</p>
+        </article>
+        <article class="summary-card">
+          <span class="metric">3.54×</span>
+          <p>NVFP4 retains strong quality through seven boundaries and is the best tested 4-bit trade-off.</p>
+        </article>
+        <article class="summary-card">
+          <span class="metric">1,024 steps</span>
+          <p>No tested format shows progressive quality decay across the decode horizon.</p>
+        </article>
+      </section>
+
+      <nav class="toc" aria-label="Report sections">
+        <a href="#mechanism">Mechanism</a>
+        <a href="#formats">Format map</a>
+        <a href="#design">Experiment design</a>
+        <a href="#quality">Quality and scale</a>
+        <a href="#time">Decode horizon</a>
+      </nav>
+
+      <section class="report-section" id="mechanism">
+        <p class="section-kicker">01 · Mechanism</p>
+        <h2>Only the bytes between pipeline stages change</h2>
+        <p class="section-intro">Stock SGLang sends <code>hidden_states</code> and <code>residual</code> as model-dtype tensors at each pipeline boundary. The experimental codec quantizes those two tensors before the send and reconstructs BF16 immediately after the receive.</p>
+
+        <div class="mechanism-grid">
+          <article class="mechanism">
+            <h3>One boundary crossing</h3>
+            <div class="mechanism-flow" aria-label="Pipeline stage wire compression flow">
+              <div class="stage">
+                <span class="stage-label">Pipeline stage n</span>
+                <span class="tensor">hidden_states [tokens, H]</span>
+                <span class="tensor">residual [tokens, H]</span>
+                <span class="tensor muted">BF16 compute</span>
+              </div>
+              <div class="wire">
+                <span class="wire-codec">quantize</span>
+                <div class="wire-line" aria-hidden="true"></div>
+                NCCL payload
+                <div class="wire-line" aria-hidden="true"></div>
+                <span class="wire-codec">dequantize</span>
+              </div>
+              <div class="stage">
+                <span class="stage-label">Pipeline stage n + 1</span>
+                <span class="tensor">hidden_states [tokens, H]</span>
+                <span class="tensor">residual [tokens, H]</span>
+                <span class="tensor muted">BF16 compute resumes</span>
+              </div>
+            </div>
+          </article>
+
+          <aside class="note-card">
+            <h3>What is not compressed</h3>
+            <ul class="plain-list">
+              <li>Layer-internal activations remain in the model dtype.</li>
+              <li>Matrix multiplication inputs use their existing compute path.</li>
+              <li>Token IDs, log probabilities, and the output ring are unchanged.</li>
+              <li>With no pipeline boundary, there is no wire to compress.</li>
+            </ul>
+          </aside>
+        </div>
+      </section>
+
+      <section class="report-section" id="formats">
+        <p class="section-kicker">02 · Format map</p>
+        <h2>Bit width is only half of the design</h2>
+        <p class="section-intro">The key distinction is how many values share a scale. A single scale across 2,048 channels is cheap, but one outlier can reduce resolution for the whole token. Microscaling confines that loss to blocks of 16 or 32 values.</p>
+
+        <div class="family-grid">
+          <article class="family-card four-bit">
+            <h3>4-bit methods tested</h3>
+            <p>All three store 4-bit values. Their scale granularity determines whether outlier channels damage an entire token or only a small block.</p>
+            <div class="method-list">
+              <div class="method-row"><strong>INT4</strong><span>One scale for all 2,048 values in a token row. This is the failing 4-bit method.</span></div>
+              <div class="method-row"><strong>MXFP4</strong><span>E2M1 values with one power-of-two E8M0 scale per 32 values.</span></div>
+              <div class="method-row"><strong>NVFP4</strong><span>E2M1 values with one E4M3 scale per 16 values and a global token scale.</span></div>
+            </div>
+            <p class="family-verdict"><strong>Result.</strong> Microscaling rescues 4-bit quality. NVFP4 is the most robust tested 4-bit method. MXFP4 remains strong on 35B, but loses more quality on 122B at seven boundaries.</p>
+          </article>
+
+          <article class="family-card eight-bit">
+            <h3>8-bit methods tested</h3>
+            <p>All three are close to BF16 quality on the 35B model. On the 122B model the two floating point formats stay at the control while the integer format does not.</p>
+            <div class="method-list">
+              <div class="method-row"><strong>INT8</strong><span>Integer values with one FP32 scale per token. It has the most mature fused implementation, but it is the only 8-bit format that loses measurable quality on the 122B model.</span></div>
+              <div class="method-row"><strong>FP8</strong><span>E4M3 floating-point values with one FP32 scale per token. It was tested at one, three, and seven boundaries.</span></div>
+              <div class="method-row"><strong>MXFP8</strong><span>E4M3 values with one E8M0 scale per 32 values. It has slightly more metadata.</span></div>
+            </div>
+            <p class="family-verdict"><strong>Result.</strong> MXFP8 has the smallest seven-boundary NLL penalty among the tested 8-bit formats, but its metadata makes it slightly larger than INT8. INT8 is the practical twofold wire baseline.</p>
+          </article>
+        </div>
+
+        <div class="table-wrap" style="margin-top: 22px">
+          <table>
+            <caption>Wire cost for one token crossing one boundary. Each crossing includes two tensors and uses H = 2,048.</caption>
+            <thead>
+              <tr>
+                <th>Family</th>
+                <th>Wire format</th>
+                <th>Scale granularity</th>
+                <th class="num">Bytes</th>
+                <th class="num">Compression</th>
+                <th>Observed role</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr class="group-row"><th colspan="6">Normal floating point</th></tr>
+              <tr>
+                <td>Baseline</td>
+                <th>BF16</th>
+                <td>No quantization</td>
+                <td class="num">8,192</td>
+                <td class="num">1.00×</td>
+                <td>Quality control and wire baseline</td>
+              </tr>
+              <tr class="group-row"><th colspan="6">4-bit compression</th></tr>
+              <tr>
+                <td>Per-token integer</td>
+                <th>INT4</th>
+                <td>One FP32 scale per token</td>
+                <td class="num">2,056</td>
+                <td class="num">3.98×</td>
+                <td class="status-bad">Fails on quality</td>
+              </tr>
+              <tr>
+                <td>Microscaled float</td>
+                <th>MXFP4</th>
+                <td>One E8M0 scale per 32 values</td>
+                <td class="num">2,176</td>
+                <td class="num">3.76×</td>
+                <td class="status-caution">Sensitive on the larger model</td>
+              </tr>
+              <tr>
+                <td>Microscaled float</td>
+                <th>NVFP4</th>
+                <td>One E4M3 scale per 16 values plus a token scale</td>
+                <td class="num">2,312</td>
+                <td class="num">3.54×</td>
+                <td class="status-good">Strongest tested 4-bit option</td>
+              </tr>
+              <tr class="group-row"><th colspan="6">8-bit compression</th></tr>
+              <tr>
+                <td>Per-token integer</td>
+                <th>INT8</th>
+                <td>One FP32 scale per token</td>
+                <td class="num">4,104</td>
+                <td class="num">2.00×</td>
+                <td class="status-caution">Costs +1.17% NLL on the 122B</td>
+              </tr>
+              <tr>
+                <td>Per-token float</td>
+                <th>FP8 E4M3</th>
+                <td>One FP32 scale per token</td>
+                <td class="num">4,104</td>
+                <td class="num">2.00×</td>
+                <td>Quality-safe through seven boundaries</td>
+              </tr>
+              <tr>
+                <td>Microscaled float</td>
+                <th>MXFP8</th>
+                <td>One E8M0 scale per 32 values</td>
+                <td class="num">4,224</td>
+                <td class="num">1.94×</td>
+                <td class="status-good">Quality-safe through seven boundaries</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <figure class="figure" aria-labelledby="payload-title">
+          <div class="figure-head">
+            <div>
+              <h3 id="payload-title">Payload per token and boundary</h3>
+              <p>Smaller bars mean fewer bytes on the wire. Scale metadata is included.</p>
+            </div>
+            <span class="pill direction-down">↓ fewer bytes is better</span>
+          </div>
+          <div class="chart-host" id="payload-chart"></div>
+          <figcaption class="sr-only">BF16 uses 8,192 bytes. INT8 and FP8 use 4,104 bytes. MXFP8 uses 4,224 bytes. INT4 uses 2,056 bytes. MXFP4 uses 2,176 bytes. NVFP4 uses 2,312 bytes.</figcaption>
+        </figure>
+
+        <div class="callout">
+          <p><strong>Why microscaling wins at 4 bits.</strong> INT4 and NVFP4 have the same value width, but they do not share scale information in the same way. NVFP4 isolates outlier channels inside 16-value blocks. That difference is more important than the small metadata overhead.</p>
+        </div>
+      </section>
+
+      <section class="report-section" id="design">
+        <p class="section-kicker">03 · Experiment design</p>
+        <h2>What we varied and why</h2>
+        <p class="section-intro">The primary question is how far boundary traffic can be reduced before repeated quantization changes model behavior. Every quality result is compared with BF16 wire tensors at the same model size and pipeline topology.</p>
+
+        <ul class="flash-list" aria-label="Experiment at a glance">
+          <li class="flash-item">
+            <span class="flash-label">Target</span>
+            <p><strong>Only pipeline traffic changes.</strong> The experiment compresses <code>hidden_states</code> and <code>residual</code> for each stage-to-stage send. Computation resumes in BF16 after each receive.</p>
+          </li>
+          <li class="flash-item">
+            <span class="flash-label">Four GPUs</span>
+            <p><strong>The 35B grid used 4 × RTX 5090.</strong> PP2/TP2 creates one boundary. PP4/TP1 creates three boundaries.</p>
+          </li>
+          <li class="flash-item">
+            <span class="flash-label">Eight GPUs</span>
+            <p><strong>The depth extension used 8 × RTX 5090.</strong> PP8/TP1 creates seven boundaries and provides the 1,024-step stress test.</p>
+          </li>
+          <li class="flash-item">
+            <span class="flash-label">Larger model</span>
+            <p><strong>The 122B checkpoint uses FP8 weights because that is what fit.</strong> It missed the four-GPU memory budget by 18 MB. Native BF16 weights did not fit on eight 32 GB GPUs. FP8 describes stored model weights, while the control still sends BF16 activations between stages.</p>
+          </li>
+          <li class="flash-item">
+            <span class="flash-label">Quality checks</span>
+            <p><strong>WikiText NLL and GSM8K answer accuracy test different failure modes.</strong> NLL is the mean negative log likelihood per token, measured teacher forced: the model scores the true next token at every position given the true prefix, so no text is generated and no sampling is involved. Each cell covers 24,576 tokens, being 24 non-overlapping 1,024 token windows from the WikiText-2 raw test split, and the tables report the change relative to the matching BF16 control, where lower is better. The measurement is deterministic to the last floating point digit on this stack, which is what makes changes well below a tenth of a percent readable: the same configuration re-run three weeks later on a different machine returned a value identical in all 17 significant digits. NLL detects small distribution shifts that leave greedy answers intact. GSM8K tests whether greedy generated answers remain correct. Each GSM8K cell is one greedy pass, at temperature 0, over the same first 100 questions of the test split, graded by numeric match.</p>
+          </li>
+          <li class="flash-item">
+            <span class="flash-label">System support</span>
+            <p><strong>The uncompressed SGLang path sends model-dtype PP tensors.</strong> This research branch adds INT8, FP8, INT4, MXFP8, MXFP4, and NVFP4 wire modes. RTX 5090 is a 32 GB Blackwell GPU with FP8 and FP4 Tensor Core arithmetic, but the microscaled wire encoders in this study are still eager prototypes rather than fused hardware paths. <a href="https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf">NVIDIA architecture reference</a>.</p>
+          </li>
+        </ul>
+      </section>
+
+      <section class="report-section" id="quality">
+        <p class="section-kicker">04 · Quality and scale</p>
+        <h2>Repeated boundaries expose scaling failures</h2>
+        <p class="section-intro">Every additional boundary inserts another quantize, send, and reconstruct step before later layers consume the activation. Fine-grained formats keep each error small. A coarse per-token scale re-injects a larger error at every boundary, which later stages can amplify.</p>
+
+        <div class="finding-grid">
+          <article class="finding-card bad">
+            <h3>INT4 failure is about its scale</h3>
+            <p>The failing INT4 method uses one scale across all 2,048 values. On 35B, its NLL penalty grows from +11% to +59% and then +190% as boundaries increase from one to three and seven. This does not apply to microscaled MXFP4 or NVFP4.</p>
+          </article>
+          <article class="finding-card good">
+            <h3>NVFP4 is more robust than MXFP4</h3>
+            <p>NLL favors NVFP4 at every shared topology. The clearest separation is the 122B model at seven boundaries, where NVFP4 records +1.86% NLL and 98% GSM8K while MXFP4 records +6.65% and 89%. That MXFP4 result was re-run on separate hardware and reproduced exactly, to every digit of NLL and to all one hundred GSM8K predictions, so it reflects the format rather than one unlucky run.</p>
+          </article>
+          <article class="finding-card caution">
+            <h3>MXFP4 is still viable on 35B</h3>
+            <p>MXFP4 stays within +1.66% NLL through seven boundaries on the 35B model. The separation from NVFP4 comes mostly from the scale format rather than the block count. Replacing MXFP4's power-of-two E8M0 scale with NVFP4's E4M3 scale accounts for 76 to 90 percent of the measured gap, while halving the block from 32 to 16 values accounts for 1 to 23 percent.</p>
+          </article>
+          <article class="finding-card good">
+            <h3>The 8-bit split appears only at scale</h3>
+            <p>On the 35B model the three 8-bit formats are equivalent, spanning +0.08% to +0.29% NLL at seven boundaries. On the 122B model they separate: FP8 and MXFP8 hold at the control, -0.02% and -0.00%, while INT8 costs +1.17%. FP8 and INT8 send the same 4,104 bytes per token under the same per-token scale, so element format is the only variable between them. A floating point exponent absorbs the activation outliers that a uniform integer grid cannot, and that matters more as the hidden size grows. Prefer FP8 or MXFP8 over INT8 for an 8-bit wire, and note that INT8 at 2.00x compression is barely ahead of NVFP4 at 3.54x.</p>
+          </article>
+        </div>
+
+        <figure class="figure" aria-labelledby="depth-title">
+          <div class="figure-head">
+            <div>
+              <h3 id="depth-title">35B BF16-weight quality cost by pipeline depth</h3>
+              <p>The deployable range and the INT4 failure range use separate scales so the near-BF16 formats remain readable.</p>
+            </div>
+            <span class="pill direction-down">↓ lower is better · 0% = BF16</span>
+          </div>
+          <div class="chart-pair">
+            <div class="chart-panel">
+              <h4>Deployable range</h4>
+              <p>Per-token INT4 is excluded here. Lower values are better.</p>
+              <div class="chart-host" id="depth-safe-chart"></div>
+              <div class="legend" aria-label="Deployable range chart legend">
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--green)">●</span>INT8</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--blue)">■</span>FP8</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--purple)">▲</span>MXFP8</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--amber)">◆</span>MXFP4</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--magenta)">⬟</span>NVFP4</span>
+              </div>
+            </div>
+            <div class="chart-panel">
+              <h4>INT4 failure range</h4>
+              <p>The same lower-is-better metric on a separate scale.</p>
+              <div class="chart-host" id="depth-int4-chart"></div>
+            </div>
+          </div>
+          <figcaption class="sr-only">On the 35B model, INT8 and MXFP8 remain below a 0.3% NLL increase through seven boundaries. NVFP4 reaches 0.43%. MXFP4 reaches 1.66%. INT4 rises from 11.04% at one boundary to 189.63% at seven. FP8 measures −0.00%, +0.06%, and +0.08% at one, three, and seven boundaries.</figcaption>
+        </figure>
+
+        <div class="subsection">
+          <h3>The larger model narrows the margin</h3>
+          <p>At seven boundaries, the NLL penalty is roughly four times larger on 122B-FP8 than on 35B for every shared usable format. INT8 grows from +0.29% to +1.17%, NVFP4 from +0.43% to +1.86%, and MXFP4 from +1.66% to +6.65%. The larger hidden size creates a 1.5 times larger activation payload, but model size and FP8 weight precision are confounded. This is a sensitivity result, not a pure scaling law. Width alone does not explain the MXFP4 gap: running the wire codecs directly on synthetic activations, the MXFP4 to NVFP4 error ratio is flat between hidden 2048 and 3072, and instead rises steeply with activation outlier severity, which points at the larger checkpoint's residual stream rather than its width.</p>
+
+          <figure class="figure" aria-labelledby="large-title">
+            <div class="figure-head">
+              <div>
+                <h3 id="large-title">122B model with FP8 weights: quality cost</h3>
+                <p>NVFP4 remains close to INT8. MXFP4 separates as depth increases.</p>
+              </div>
+              <span class="pill direction-down">↓ lower is better · 0% = BF16</span>
+            </div>
+            <div class="chart-host" id="large-model-chart"></div>
+            <div class="legend" aria-label="Larger model chart legend">
+              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--green)">●</span>INT8</span>
+              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--amber)">◆</span>MXFP4</span>
+              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--magenta)">⬟</span>NVFP4</span>
+              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--blue)">■</span>FP8</span>
+              <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--purple)">▲</span>MXFP8</span>
+            </div>
+            <figcaption class="sr-only">At three and seven boundaries, INT8 increases NLL by 0.59% and 1.17%. MXFP4 increases it by 2.56% and 6.65%. NVFP4 increases it by 0.75% and 1.86%. FP8 changes it by -0.15% and -0.02%, and MXFP8 by -0.01% and -0.00%, both at the control level.</figcaption>
+          </figure>
+
+          <div class="callout danger">
+            <p><strong>INT4 is outside the plotted range.</strong> Its NLL penalty is 421.20% at three boundaries and 495.31% at seven. GSM8K is 0% in both cases.</p>
+          </div>
+        </div>
+
+        <div class="subsection">
+          <h3>GSM8K accuracy confirms the family split, not a ranking</h3>
+          <p>GSM8K checks generated answers rather than teacher-forced likelihood. Higher values are better. Each bar is a single greedy decoding pass, at temperature 0, over the same first 100 questions of the GSM8K test split, graded by numeric match. That makes these bars a screen for gross damage at an early stage of the experiment, not a ranking. One hundred questions is one hundred questions: a gap of two or three points is two or three answers, so read the large gaps and ignore the small ones.</p>
+
+          <figure class="figure" aria-labelledby="gsm35-title">
+            <div class="figure-head">
+              <div>
+                <h3 id="gsm35-title">35B BF16-weight GSM8K accuracy by bit-width family</h3>
+                <p>Both panels use the full 0 to 100% scale, so bar heights are directly comparable. Each bar is labelled with its score.</p>
+              </div>
+              <span class="pill direction-up">↑ higher is better</span>
+            </div>
+            <div class="chart-pair">
+              <div class="chart-panel">
+                <h4>Microscaled 4-bit methods</h4>
+                <p>BF16, MXFP4, and NVFP4 on the shared scale.</p>
+                <div class="chart-host" id="gsm35-4bit-chart"></div>
+                <div class="legend" aria-label="35B 4-bit GSM8K chart legend">
+                  <span class="legend-item"><span class="swatch-block" style="--swatch: var(--gray-series)"></span>BF16</span>
+                  <span class="legend-item"><span class="swatch-block" style="--swatch: var(--amber)"></span>MXFP4</span>
+                  <span class="legend-item"><span class="swatch-block" style="--swatch: var(--magenta)"></span>NVFP4</span>
+                </div>
+              </div>
+              <div class="chart-panel">
+                <h4>8-bit methods</h4>
+                <p>BF16, INT8, FP8, and MXFP8 on the shared scale.</p>
+                <div class="chart-host" id="gsm35-8bit-chart"></div>
+                <div class="legend" aria-label="35B 8-bit GSM8K chart legend">
+                  <span class="legend-item"><span class="swatch-block" style="--swatch: var(--gray-series)"></span>BF16</span>
+                  <span class="legend-item"><span class="swatch-block" style="--swatch: var(--green)"></span>INT8</span>
+                  <span class="legend-item"><span class="swatch-block" style="--swatch: var(--blue)"></span>FP8</span>
+                  <span class="legend-item"><span class="swatch-block" style="--swatch: var(--purple)"></span>MXFP8</span>
+                </div>
+              </div>
+            </div>
+            <p class="metric-note"><strong>Per-token INT4 is not plotted in either panel.</strong> It is the non-microscaled control rather than a candidate format, and it fails outright: 64%, then 3%, then 0% as boundaries increase from one to three and seven.</p>
+            <figcaption class="sr-only">Grouped bars on a 0 to 100% scale. At one, three, and seven boundaries: BF16 scores 97%, 97%, and 96%; MXFP4 scores 96%, 99%, and 98%; NVFP4 scores 97%, 97%, and 95%; INT8 scores 97%, 96%, and 99%; MXFP8 scores 97%, 95%, and 96%. FP8 scores 96%, 94%, and 97% at one, three, and seven boundaries. Every bar sits between 94% and 99%. Per-token INT4 is not plotted; it falls from 64% to 3% and then 0%.</figcaption>
+          </figure>
+
+          <figure class="figure" aria-labelledby="gsm122-title">
+            <div class="figure-head">
+              <div>
+                <h3 id="gsm122-title">122B model with FP8 weights: GSM8K accuracy</h3>
+                <p>MXFP4 at seven boundaries is the only gap in this set wider than a few questions. INT4 is omitted from the plot because it records 0% at both depths.</p>
+              </div>
+              <span class="pill direction-up">↑ higher is better</span>
+            </div>
+            <div class="chart-host" id="gsm122-chart"></div>
+            <div class="legend" aria-label="122B GSM8K chart legend">
+              <span class="legend-item"><span class="swatch-block" style="--swatch: var(--gray-series)"></span>BF16</span>
+              <span class="legend-item"><span class="swatch-block" style="--swatch: var(--green)"></span>INT8</span>
+              <span class="legend-item"><span class="swatch-block" style="--swatch: var(--amber)"></span>MXFP4</span>
+              <span class="legend-item"><span class="swatch-block" style="--swatch: var(--magenta)"></span>NVFP4</span>
+              <span class="legend-item"><span class="swatch-block" style="--swatch: var(--blue)"></span>FP8</span>
+              <span class="legend-item"><span class="swatch-block" style="--swatch: var(--purple)"></span>MXFP8</span>
+            </div>
+            <figcaption class="sr-only">Grouped bars on a 0 to 100% scale. At three and seven boundaries, BF16 scores 96% and 97%, INT8 scores 96% and 96%, MXFP4 scores 97% and 89%, NVFP4 scores 96% and 98%, FP8 scores 97% and 97%, and MXFP8 scores 95% and 98%.</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="report-section" id="time">
+        <p class="section-kicker">05 · Decode horizon</p>
+        <h2>Error does not grow with decode position</h2>
+        <p class="section-intro">The boundary experiment asks what happens within one forward pass. The decode-horizon probe asks whether the model carries compression damage forward through its recurrent state as the context grows.</p>
+
+        <h3 style="margin-top: 24px">How the probe works</h3>
+        <ol class="flash-list">
+          <li class="flash-item">
+            <span class="flash-label">1 · Freeze</span>
+            <p>BF16 first generates twelve greedy 1,024-token continuations from six WikiText and six GSM8K prompts. These token sequences become the shared references.</p>
+          </li>
+          <li class="flash-item">
+            <span class="flash-label">2 · Replay</span>
+            <p>Each wire format replays the same prompt and continuation with teacher forcing at seven pipeline boundaries. Input tokens are identical, while activations and recurrent state evolve under that format.</p>
+          </li>
+          <li class="flash-item">
+            <span class="flash-label">3 · Compare</span>
+            <p>At every position, the probe records NLL and whether the format's top prediction matches the frozen BF16 token. The 1,024 positions are averaged into eight 128-token segments.</p>
+          </li>
+          <li class="flash-item">
+            <span class="flash-label">4 · Interpret</span>
+            <p>A downward trend would indicate progressive drift as context grows. The usable formats remain flat, and their NLL improves with added context in the same direction as BF16.</p>
+          </li>
+        </ol>
+
+        <figure class="figure" aria-labelledby="time-title">
+          <div class="figure-head">
+            <div>
+              <h3 id="time-title">Top-1 agreement across 1,024 decode steps</h3>
+              <p>Each point is one 128-step segment on the 35B model with seven boundary crossings per forward pass.</p>
+            </div>
+            <span class="pill direction-flat">↑ higher is better · flat is stable</span>
+          </div>
+          <div class="chart-pair">
+            <div class="chart-panel">
+              <h4>BF16 and usable formats</h4>
+              <p>The vertical scale runs from 94% to 100%.</p>
+              <div class="chart-host" id="time-safe-chart"></div>
+              <div class="legend" aria-label="Temporal agreement chart legend">
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--gray-series)">○</span>BF16</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--green)">●</span>INT8</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--amber)">◆</span>MXFP4</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--magenta)">⬟</span>NVFP4</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--blue)">■</span>FP8</span>
+                <span class="legend-item"><span class="marker-symbol" style="--marker-color: var(--purple)">▲</span>MXFP8</span>
+              </div>
+            </div>
+            <div class="chart-panel">
+              <h4>INT4 failure level</h4>
+              <p>The vertical scale runs from 20% to 35%.</p>
+              <div class="chart-host" id="time-int4-chart"></div>
+            </div>
+          </div>
+          <figcaption class="sr-only">BF16, INT8, FP8, MXFP8, MXFP4, and NVFP4 show no downward trend across eight segments. INT4 stays between 23% and 29% agreement and also shows no progressive decline.</figcaption>
+        </figure>
+
+        <div class="callout">
+          <p><strong>What this supports.</strong> Additional pipeline boundaries can amplify coarse quantization error inside one forward pass. The tested frozen trajectories show no progressive representational drift across decode position. Because the probe is teacher-forced, it does not prove that every free-running generation will remain identical. GSM8K provides the separate free-running task check.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <p>This report has no external runtime dependencies. Results were collected on 21 to 24 August 2026 from archived SGLang experiment outputs.</p>
+    </footer>
+  </div>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const NS = "http://www.w3.org/2000/svg";
+      const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      const colors = {
+        bf16: () => css("--gray-series"),
+        int8: () => css("--green"),
+        fp8: () => css("--blue"),
+        mxfp8: () => css("--purple"),
+        int4: () => css("--red"),
+        mxfp4: () => css("--amber"),
+        nvfp4: () => css("--magenta")
+      };
+
+      function node(name, attrs = {}, text = "") {
+        const element = document.createElementNS(NS, name);
+        for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, String(value));
+        if (text !== "") element.textContent = text;
+        return element;
+      }
+
+      function clear(host) {
+        while (host.firstChild) host.removeChild(host.firstChild);
+      }
+
+      function svgBase(host, height, label) {
+        const width = Math.max(300, Math.floor(host.getBoundingClientRect().width));
+        const svg = node("svg", { viewBox: `0 0 ${width} ${height}`, role: "img", "aria-label": label });
+        svg.appendChild(node("title", {}, label));
+        host.appendChild(svg);
+        return { svg, width };
+      }
+
+      function formatNumber(value, digits = 1) {
+        return new Intl.NumberFormat("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits }).format(value);
+      }
+
+      function drawHorizontalBars(hostId, data) {
+        const host = document.getElementById(hostId);
+        if (!host) return;
+        clear(host);
+        const compact = host.getBoundingClientRect().width < 520;
+        const rowHeight = compact ? 38 : 42;
+        const height = data.length * rowHeight + 48;
+        const { svg, width } = svgBase(host, height, "Payload bytes per token and pipeline boundary");
+        const left = compact ? 74 : 104;
+        const right = compact ? 48 : 78;
+        const top = 15;
+        const max = 8192;
+        const plotWidth = width - left - right;
+
+        data.forEach((d, index) => {
+          const y = top + index * rowHeight;
+          const barWidth = Math.max(2, d.value / max * plotWidth);
+          svg.appendChild(node("text", { x: left - 10, y: y + 19, "text-anchor": "end", class: "bar-label" }, d.label));
+          svg.appendChild(node("rect", { x: left, y: y + 5, width: plotWidth, height: 22, rx: 4, fill: css("--bg") }));
+          const bar = node("rect", { x: left, y: y + 5, width: barWidth, height: 22, rx: 4, fill: colors[d.key]() });
+          bar.appendChild(node("title", {}, `${d.label}: ${d.value.toLocaleString()} bytes, ${d.ratio} compression`));
+          svg.appendChild(bar);
+          const valueX = Math.min(width - 4, left + barWidth + 8);
+          const anchor = d.value / max > 0.82 || valueX > width - 64 ? "end" : "start";
+          svg.appendChild(node("text", { x: anchor === "end" ? width - 4 : valueX, y: y + 20, "text-anchor": anchor, class: "bar-value" }, compact ? d.ratio : `${d.value.toLocaleString()} B · ${d.ratio}`));
+        });
+      }
+
+      function addSeriesMarker(svg, key, cx, cy, titleText) {
+        const color = colors[key]();
+        let marker;
+        if (key === "fp8") {
+          marker = node("rect", { x: cx - 4.2, y: cy - 4.2, width: 8.4, height: 8.4, rx: 1, fill: color, class: "series-point" });
+        } else if (key === "mxfp8") {
+          marker = node("polygon", { points: `${cx},${cy - 5} ${cx + 5},${cy + 4} ${cx - 5},${cy + 4}`, fill: color, class: "series-point" });
+        } else if (key === "mxfp4") {
+          marker = node("polygon", { points: `${cx},${cy - 5} ${cx + 5},${cy} ${cx},${cy + 5} ${cx - 5},${cy}`, fill: color, class: "series-point" });
+        } else if (key === "nvfp4") {
+          marker = node("polygon", { points: `${cx},${cy - 5} ${cx + 4.8},${cy - 1.5} ${cx + 3},${cy + 4.5} ${cx - 3},${cy + 4.5} ${cx - 4.8},${cy - 1.5}`, fill: color, class: "series-point" });
+        } else if (key === "bf16") {
+          marker = node("circle", { cx, cy, r: 4.2, fill: css("--paper"), stroke: color, "stroke-width": 2.2 });
+        } else {
+          marker = node("circle", { cx, cy, r: 4.5, fill: color, class: "series-point" });
+        }
+        marker.appendChild(node("title", {}, titleText));
+        svg.appendChild(marker);
+      }
+
+      function drawLineChart(hostId, config) {
+        const host = document.getElementById(hostId);
+        if (!host) return;
+        clear(host);
+        const compact = host.getBoundingClientRect().width < 480;
+        const height = config.height || 280;
+        const { svg, width } = svgBase(host, height, config.label);
+        const margin = { top: 14, right: compact ? 14 : 22, bottom: 45, left: compact ? 58 : 66 };
+        const plotWidth = width - margin.left - margin.right;
+        const plotHeight = height - margin.top - margin.bottom;
+        const xValues = config.xValues;
+        const [yMin, yMax] = config.yDomain;
+        const dodgeStep = compact ? 6 : 8;
+        const xInset = config.dodge ? Math.max(16, (config.series.length - 1) * dodgeStep / 2 + 7) : 6;
+        const x = value => margin.left + (xValues.length === 1 ? plotWidth / 2 : xInset + xValues.indexOf(value) / (xValues.length - 1) * (plotWidth - 2 * xInset));
+        const seriesX = (value, seriesIndex) => x(value) + (config.dodge ? (seriesIndex - (config.series.length - 1) / 2) * dodgeStep : 0);
+        const y = value => margin.top + (yMax - value) / (yMax - yMin) * plotHeight;
+
+        for (const tick of config.yTicks) {
+          const yy = y(tick);
+          svg.appendChild(node("line", { x1: margin.left, y1: yy, x2: width - margin.right, y2: yy, class: "grid-line" }));
+          svg.appendChild(node("text", { x: margin.left - 8, y: yy + 4, "text-anchor": "end", class: "axis-text" }, config.yFormat(tick)));
+        }
+
+        svg.appendChild(node("line", { x1: margin.left, y1: margin.top + plotHeight, x2: width - margin.right, y2: margin.top + plotHeight, class: "axis-line" }));
+        xValues.forEach((value, index) => {
+          const xx = x(value);
+          svg.appendChild(node("line", { x1: xx, y1: margin.top + plotHeight, x2: xx, y2: margin.top + plotHeight + 5, class: "axis-line" }));
+          if (!compact || index % Math.ceil(xValues.length / 4) === 0 || index === xValues.length - 1) {
+            svg.appendChild(node("text", { x: xx, y: height - 21, "text-anchor": "middle", class: "axis-text" }, config.xFormat(value)));
+          }
+        });
+
+        if (yMin < 0 && yMax > 0) {
+          svg.appendChild(node("line", { x1: margin.left, y1: y(0), x2: width - margin.right, y2: y(0), stroke: css("--faint"), "stroke-width": 1.4 }));
+        }
+
+        config.series.forEach((series, seriesIndex) => {
+          const points = series.values.filter(d => d.y !== null && d.y !== undefined);
+          if (!points.length) return;
+          if (config.connect !== false) {
+            const path = points.map((d, index) => `${index === 0 ? "M" : "L"}${seriesX(d.x, seriesIndex)},${y(d.y)}`).join(" ");
+            svg.appendChild(node("path", { d: path, class: "series-line", stroke: colors[series.key]() }));
+          }
+          points.forEach(d => {
+            const xx = seriesX(d.x, seriesIndex);
+            addSeriesMarker(svg, series.key, xx, y(d.y), `${series.label}, ${config.xTooltip(d.x)}: ${config.tooltipFormat(d.y)}`);
+          });
+        });
+
+        // Coverage notes for series that stop short of the last x value. Text only,
+        // deliberately without a marker or a trailing line, so nothing reads as a
+        // measured y at an x we never ran.
+        (config.annotations || []).forEach(a => {
+          svg.appendChild(node("text", {
+            x: x(a.x) + (a.dx || 0),
+            y: y(a.y) + (a.dy || 0),
+            "text-anchor": a.anchor || "middle",
+            fill: a.key ? colors[a.key]() : css("--muted"),
+            "font-size": compact ? 10 : 11,
+            "font-weight": 700
+          }, a.text));
+        });
+
+        svg.appendChild(node("text", { x: margin.left + plotWidth / 2, y: height - 2, "text-anchor": "middle", class: "axis-text" }, config.xTitle));
+        svg.appendChild(node("text", { x: 13, y: margin.top + plotHeight / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 13 ${margin.top + plotHeight / 2})` }, config.yTitle));
+      }
+
+      function drawVerticalBars(hostId, config) {
+        const host = document.getElementById(hostId);
+        if (!host) return;
+        clear(host);
+        const height = 280;
+        const { svg, width } = svgBase(host, height, config.label);
+        const margin = { top: 17, right: 14, bottom: 45, left: 60 };
+        const plotWidth = width - margin.left - margin.right;
+        const plotHeight = height - margin.top - margin.bottom;
+        const [yMin, yMax] = config.yDomain;
+        const band = plotWidth / config.data.length;
+        const y = value => margin.top + (yMax - value) / (yMax - yMin) * plotHeight;
+
+        for (const tick of config.yTicks) {
+          const yy = y(tick);
+          svg.appendChild(node("line", { x1: margin.left, y1: yy, x2: width - margin.right, y2: yy, class: "grid-line" }));
+          svg.appendChild(node("text", { x: margin.left - 8, y: yy + 4, "text-anchor": "end", class: "axis-text" }, config.yFormat(tick)));
+        }
+
+        config.data.forEach((d, index) => {
+          const x = margin.left + index * band + band * 0.21;
+          const barWidth = band * 0.58;
+          const top = y(d.value);
+          const rect = node("rect", { x, y: top, width: barWidth, height: margin.top + plotHeight - top, rx: 5, fill: colors[d.key]() });
+          rect.appendChild(node("title", {}, `${d.label}: ${formatNumber(d.value, 2)}% NLL increase`));
+          svg.appendChild(rect);
+          svg.appendChild(node("text", { x: x + barWidth / 2, y: Math.max(13, top - 7), "text-anchor": "middle", class: "bar-value" }, `${formatNumber(d.value, d.value < 100 ? 1 : 0)}%`));
+          svg.appendChild(node("text", { x: x + barWidth / 2, y: height - 21, "text-anchor": "middle", class: "axis-text" }, d.label));
+        });
+
+        svg.appendChild(node("text", { x: margin.left + plotWidth / 2, y: height - 2, "text-anchor": "middle", class: "axis-text" }, config.xTitle));
+        svg.appendChild(node("text", { x: 13, y: margin.top + plotHeight / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 13 ${margin.top + plotHeight / 2})` }, config.yTitle));
+      }
+
+      // Grouped bars on a zero-based axis. Used for the GSM8K panels, where the
+      // honest reading is "every healthy format is the same height" and the exact
+      // score is printed on the bar rather than inferred from a truncated scale.
+      function drawGroupedBars(hostId, config) {
+        const host = document.getElementById(hostId);
+        if (!host) return;
+        clear(host);
+        const compact = host.getBoundingClientRect().width < 480;
+        const height = config.height || 280;
+        const { svg, width } = svgBase(host, height, config.label);
+        const margin = { top: 36, right: compact ? 10 : 16, bottom: 45, left: compact ? 46 : 56 };
+        const plotWidth = width - margin.left - margin.right;
+        const plotHeight = height - margin.top - margin.bottom;
+        const [yMin, yMax] = config.yDomain;
+        const y = value => margin.top + (yMax - value) / (yMax - yMin) * plotHeight;
+        const baseline = y(yMin);
+        const band = plotWidth / config.xValues.length;
+
+        for (const tick of config.yTicks) {
+          const yy = y(tick);
+          svg.appendChild(node("line", { x1: margin.left, y1: yy, x2: width - margin.right, y2: yy, class: "grid-line" }));
+          svg.appendChild(node("text", { x: margin.left - 8, y: yy + 4, "text-anchor": "end", class: "axis-text" }, config.yFormat(tick)));
+        }
+        svg.appendChild(node("line", { x1: margin.left, y1: baseline, x2: width - margin.right, y2: baseline, class: "axis-line" }));
+
+        // One slot per series for the whole chart, not per group, so every bar in the
+        // figure is the same width and a format keeps the same position in every
+        // group. A format we never ran at a given depth leaves its slot empty, so a
+        // gap in the matrix stays visible rather than closing up.
+        const slots = config.series.length;
+        const inner = Math.min(band * 0.82, slots * (compact ? 22 : 52));
+        const slot = inner / slots;
+        const barWidth = Math.min(compact ? 17 : 42, slot * 0.82);
+        // Three tiers of room for the score: full size, small, and turned on its side.
+        const labelClass = slot >= 40 ? "bar-value" : "bar-value-sm";
+        const labelsFitFlat = slot >= 26;
+
+        config.xValues.forEach((xValue, groupIndex) => {
+          const bandCenter = margin.left + groupIndex * band + band / 2;
+
+          config.series.forEach((series, slotIndex) => {
+            const point = series.values.find(d => d.x === xValue && d.y !== null && d.y !== undefined);
+            if (!point) return;
+            const center = bandCenter - inner / 2 + slot * (slotIndex + 0.5);
+            const top = y(point.y);
+            const bar = node("rect", {
+              x: center - barWidth / 2,
+              y: top,
+              width: barWidth,
+              height: Math.max(1, baseline - top),
+              rx: 3,
+              fill: colors[series.key]()
+            });
+            bar.appendChild(node("title", {}, `${series.label}, ${config.xTooltip(xValue)}: ${config.tooltipFormat(point.y)}`));
+            svg.appendChild(bar);
+
+            // The score is always printed. When the slots are too narrow for it to
+            // sit flat without colliding with the next bar, it turns and reads
+            // upward in the headroom above the bar instead of being dropped.
+            const text = config.valueFormat(point.y);
+            if (labelsFitFlat) {
+              svg.appendChild(node("text", { x: center, y: top - 7, "text-anchor": "middle", class: labelClass }, text));
+            } else {
+              const group = node("g", { transform: `translate(${center}, ${top - 5}) rotate(-90)` });
+              group.appendChild(node("text", { x: 0, y: 0, "text-anchor": "start", "dominant-baseline": "middle", class: "bar-value-sm" }, text));
+              svg.appendChild(group);
+            }
+          });
+
+          svg.appendChild(node("text", { x: bandCenter, y: height - 21, "text-anchor": "middle", class: "axis-text" }, config.xFormat(xValue)));
+        });
+
+        svg.appendChild(node("text", { x: margin.left + plotWidth / 2, y: height - 2, "text-anchor": "middle", class: "axis-text" }, config.xTitle));
+        svg.appendChild(node("text", { x: 13, y: margin.top + plotHeight / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 13 ${margin.top + plotHeight / 2})` }, config.yTitle));
+      }
+
+      const payloadData = [
+        { label: "BF16", value: 8192, ratio: "1.00×", key: "bf16" },
+        { label: "INT4", value: 2056, ratio: "3.98×", key: "int4" },
+        { label: "MXFP4", value: 2176, ratio: "3.76×", key: "mxfp4" },
+        { label: "NVFP4", value: 2312, ratio: "3.54×", key: "nvfp4" },
+        { label: "INT8", value: 4104, ratio: "2.00×", key: "int8" },
+        { label: "FP8", value: 4104, ratio: "2.00×", key: "fp8" },
+        { label: "MXFP8", value: 4224, ratio: "1.94×", key: "mxfp8" }
+      ];
+
+      const depthSafeConfig = {
+        label: "35B BF16-weight NLL change in the deployable range by pipeline boundary count",
+        xValues: [1, 3, 7],
+        xTitle: "Pipeline boundaries per forward pass",
+        yTitle: "NLL change (%)",
+        xFormat: value => String(value),
+        xTooltip: value => `${value} ${value === 1 ? "boundary" : "boundaries"}`,
+        yDomain: [-0.1, 2.0],
+        yTicks: [0, 0.5, 1.0, 1.5, 2.0],
+        yFormat: value => `${formatNumber(value, 1)}%`,
+        tooltipFormat: value => `${formatNumber(value, 2)}% NLL change`,
+        series: [
+          { key: "int8", label: "INT8", values: [{ x: 1, y: 0.1118 }, { x: 3, y: 0.0325 }, { x: 7, y: 0.2891 }] },
+          { key: "fp8", label: "FP8", values: [{ x: 1, y: -0.0048 }, { x: 3, y: 0.0561 }, { x: 7, y: 0.0754 }] },
+          { key: "mxfp8", label: "MXFP8", values: [{ x: 1, y: 0.0152 }, { x: 3, y: 0.0321 }, { x: 7, y: 0.0815 }] },
+          { key: "mxfp4", label: "MXFP4", values: [{ x: 1, y: 0.1851 }, { x: 3, y: 0.5254 }, { x: 7, y: 1.6602 }] },
+          { key: "nvfp4", label: "NVFP4", values: [{ x: 1, y: 0.1066 }, { x: 3, y: 0.0522 }, { x: 7, y: 0.4338 }] }
+        ],
+      };
+
+      const largeModelConfig = {
+        label: "122B model with FP8 weights, NLL change by pipeline boundary count",
+        xValues: [3, 7],
+        xTitle: "Pipeline boundaries per forward pass",
+        yTitle: "NLL change (%)",
+        xFormat: value => String(value),
+        xTooltip: value => `${value} boundaries`,
+        yDomain: [-0.35, 7],
+        yTicks: [0, 1, 2, 3, 4, 5, 6, 7],
+        yFormat: value => `${value}%`,
+        tooltipFormat: value => `${formatNumber(value, 2)}% NLL increase`,
+        series: [
+          { key: "int8", label: "INT8", values: [{ x: 3, y: 0.5890 }, { x: 7, y: 1.1699 }] },
+          { key: "mxfp4", label: "MXFP4", values: [{ x: 3, y: 2.5575 }, { x: 7, y: 6.6538 }] },
+          { key: "nvfp4", label: "NVFP4", values: [{ x: 3, y: 0.7477 }, { x: 7, y: 1.8571 }] },
+          { key: "fp8", label: "FP8", values: [{ x: 3, y: -0.1471 }, { x: 7, y: -0.024 }] },
+          { key: "mxfp8", label: "MXFP8", values: [{ x: 3, y: -0.007 }, { x: 7, y: -0.0042 }] }
+        ]
+      };
+
+      const gsm35FourBitConfig = {
+        label: "35B BF16-weight GSM8K accuracy for BF16 and microscaled 4-bit wire formats",
+        xValues: [1, 3, 7],
+        xTitle: "Pipeline boundaries per forward pass",
+        yTitle: "GSM8K accuracy (%)",
+        xFormat: value => String(value),
+        xTooltip: value => `${value} ${value === 1 ? "boundary" : "boundaries"}`,
+        yDomain: [0, 100],
+        yTicks: [0, 25, 50, 75, 100],
+        yFormat: value => `${value}%`,
+        tooltipFormat: value => `${formatNumber(value, 0)}% accuracy`,
+        valueFormat: value => `${formatNumber(value, 0)}%`,
+        series: [
+          { key: "bf16", label: "BF16", values: [{ x: 1, y: 97 }, { x: 3, y: 97 }, { x: 7, y: 96 }] },
+          { key: "mxfp4", label: "MXFP4", values: [{ x: 1, y: 96 }, { x: 3, y: 99 }, { x: 7, y: 98 }] },
+          { key: "nvfp4", label: "NVFP4", values: [{ x: 1, y: 97 }, { x: 3, y: 97 }, { x: 7, y: 95 }] }
+        ]
+      };
+
+      const gsm35EightBitConfig = {
+        label: "35B BF16-weight GSM8K accuracy for BF16 and 8-bit wire formats",
+        xValues: [1, 3, 7],
+        xTitle: "Pipeline boundaries per forward pass",
+        yTitle: "GSM8K accuracy (%)",
+        xFormat: value => String(value),
+        xTooltip: value => `${value} ${value === 1 ? "boundary" : "boundaries"}`,
+        yDomain: [0, 100],
+        yTicks: [0, 25, 50, 75, 100],
+        yFormat: value => `${value}%`,
+        tooltipFormat: value => `${formatNumber(value, 0)}% accuracy`,
+        valueFormat: value => `${formatNumber(value, 0)}%`,
+        series: [
+          { key: "bf16", label: "BF16", values: [{ x: 1, y: 97 }, { x: 3, y: 97 }, { x: 7, y: 96 }] },
+          { key: "int8", label: "INT8", values: [{ x: 1, y: 97 }, { x: 3, y: 96 }, { x: 7, y: 99 }] },
+          { key: "fp8", label: "FP8", values: [{ x: 1, y: 96 }, { x: 3, y: 94 }, { x: 7, y: 97 }] },
+          { key: "mxfp8", label: "MXFP8", values: [{ x: 1, y: 97 }, { x: 3, y: 95 }, { x: 7, y: 96 }] }
+        ]
+      };
+
+      const gsm122Config = {
+        label: "122B model with FP8 weights, GSM8K accuracy for usable wire formats",
+        xValues: [3, 7],
+        xTitle: "Pipeline boundaries per forward pass",
+        yTitle: "GSM8K accuracy (%)",
+        xFormat: value => String(value),
+        xTooltip: value => `${value} boundaries`,
+        yDomain: [0, 100],
+        yTicks: [0, 25, 50, 75, 100],
+        yFormat: value => `${value}%`,
+        tooltipFormat: value => `${formatNumber(value, 0)}% accuracy`,
+        valueFormat: value => `${formatNumber(value, 0)}%`,
+        series: [
+          { key: "bf16", label: "BF16", values: [{ x: 3, y: 96 }, { x: 7, y: 97 }] },
+          { key: "int8", label: "INT8", values: [{ x: 3, y: 96 }, { x: 7, y: 96 }] },
+          { key: "mxfp4", label: "MXFP4", values: [{ x: 3, y: 97 }, { x: 7, y: 89 }] },
+          { key: "nvfp4", label: "NVFP4", values: [{ x: 3, y: 96 }, { x: 7, y: 98 }] },
+          { key: "fp8", label: "FP8", values: [{ x: 3, y: 97 }, { x: 7, y: 97 }] },
+          { key: "mxfp8", label: "MXFP8", values: [{ x: 3, y: 95 }, { x: 7, y: 98 }] }
+        ]
+      };
+
+      const timeSafeConfig = {
+        label: "Top-1 agreement across eight decode segments for healthy and recoverable formats",
+        xValues: [1, 2, 3, 4, 5, 6, 7, 8],
+        xTitle: "128-token segment",
+        yTitle: "Agreement (%)",
+        xFormat: value => String(value),
+        xTooltip: value => `segment ${value}`,
+        yDomain: [94, 100],
+        yTicks: [94, 96, 98, 100],
+        yFormat: value => `${value}%`,
+        tooltipFormat: value => `${formatNumber(value, 2)}% agreement`,
+        series: [
+          { key: "bf16", label: "BF16", values: [98.76, 98.89, 99.22, 99.02, 99.15, 99.22, 99.02, 99.35].map((y, i) => ({ x: i + 1, y })) },
+          { key: "int8", label: "INT8", values: [97.33, 98.18, 98.18, 98.50, 98.70, 98.37, 97.59, 98.63].map((y, i) => ({ x: i + 1, y })) },
+          { key: "mxfp4", label: "MXFP4", values: [94.60, 97.27, 96.81, 97.01, 96.61, 96.48, 96.42, 97.01].map((y, i) => ({ x: i + 1, y })) },
+          { key: "nvfp4", label: "NVFP4", values: [97.27, 98.37, 98.37, 98.63, 97.92, 97.66, 97.66, 98.31].map((y, i) => ({ x: i + 1, y })) },
+          { key: "fp8", label: "FP8", values: [98.11, 99.09, 98.89, 98.50, 99.22, 98.37, 99.02, 98.96].map((y, i) => ({ x: i + 1, y })) },
+          { key: "mxfp8", label: "MXFP8", values: [98.44, 98.96, 98.96, 98.18, 98.83, 98.50, 98.57, 98.96].map((y, i) => ({ x: i + 1, y })) }
+        ]
+      };
+
+      const timeInt4Config = {
+        label: "Top-1 agreement across eight decode segments for INT4",
+        xValues: [1, 2, 3, 4, 5, 6, 7, 8],
+        xTitle: "128-token segment",
+        yTitle: "Agreement (%)",
+        xFormat: value => String(value),
+        xTooltip: value => `segment ${value}`,
+        yDomain: [20, 35],
+        yTicks: [20, 25, 30, 35],
+        yFormat: value => `${value}%`,
+        tooltipFormat: value => `${formatNumber(value, 2)}% agreement`,
+        series: [
+          { key: "int4", label: "INT4", values: [22.98, 26.24, 26.50, 27.08, 26.43, 27.54, 25.26, 29.30].map((y, i) => ({ x: i + 1, y })) }
+        ]
+      };
+
+
+      const renderers = [
+        ["payload-chart", () => drawHorizontalBars("payload-chart", payloadData)],
+        ["depth-safe-chart", () => drawLineChart("depth-safe-chart", depthSafeConfig)],
+        ["depth-int4-chart", () => drawVerticalBars("depth-int4-chart", {
+          label: "INT4 NLL increase by pipeline boundary count",
+          xTitle: "Pipeline boundaries per forward pass",
+          yTitle: "NLL change (%)",
+          yDomain: [0, 200],
+          yTicks: [0, 50, 100, 150, 200],
+          yFormat: value => `${value}%`,
+          data: [
+            { label: "1", value: 11.0404, key: "int4" },
+            { label: "3", value: 59.2583, key: "int4" },
+            { label: "7", value: 189.6301, key: "int4" }
+          ]
+        })],
+        ["large-model-chart", () => drawLineChart("large-model-chart", largeModelConfig)],
+        ["gsm35-4bit-chart", () => drawGroupedBars("gsm35-4bit-chart", gsm35FourBitConfig)],
+        ["gsm35-8bit-chart", () => drawGroupedBars("gsm35-8bit-chart", gsm35EightBitConfig)],
+        ["gsm122-chart", () => drawGroupedBars("gsm122-chart", gsm122Config)],
+        ["time-safe-chart", () => drawLineChart("time-safe-chart", timeSafeConfig)],
+        ["time-int4-chart", () => drawLineChart("time-int4-chart", timeInt4Config)]
+      ];
+
+      const rendererIsVisible = id => {
+        const host = document.getElementById(id);
+        return host && !host.closest("details:not([open])");
+      };
+
+      renderers.forEach(([id, render]) => {
+        if (rendererIsVisible(id)) render();
+      });
+
+      const observer = new ResizeObserver(entries => {
+        for (const entry of entries) {
+          const match = renderers.find(([id]) => id === entry.target.id);
+          if (match) match[1]();
+        }
+      });
+      renderers.forEach(([id]) => {
+        const host = document.getElementById(id);
+        if (host) observer.observe(host);
+      });
+
+
+      const themeObserver = new MutationObserver(() => renderers.forEach(([id, render]) => {
+        if (rendererIsVisible(id)) render();
+      }));
+      themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style", "data-theme"] });
+    })();
+  </script>
+</body>
+</html>

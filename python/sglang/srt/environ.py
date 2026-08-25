@@ -579,6 +579,11 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # PP: lossy wire format for inter-stage activations (proxy ring only).
+    # Per-token scales: "int8", "fp8" (CUDA/MUSA only), "int4"; block scales:
+    # "mxfp8", "mxfp4" (e8m0 per 32), "nvfp4" (e4m3 per 16 + per-token global).
+    # Compute stays in model dtype; ignored when pp_size == 1.
+    SGLANG_PP_ACTIVATION_WIRE_QUANT = EnvStr(None)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================

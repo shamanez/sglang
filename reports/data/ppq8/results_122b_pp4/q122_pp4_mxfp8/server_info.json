@@ -1,0 +1,1 @@
+{"pp_size": 4, "tp_size": 2, "attention_backend": "flashinfer", "version": "0.0.0.dev16934+g9f886f14a.d20260824", "SGLANG_PP_ACTIVATION_WIRE_QUANT": "mxfp8"}
